@@ -203,9 +203,6 @@
         <div class="chat-header">
             <h1>🤖 Live News AI</h1>
             <p>Ask me about today's news or chat normally!</p>
-            <div class="status-indicator" id="status">
-                <span id="status-text">Checking...</span>
-            </div>
         </div>
         
         <div class="chat-messages" id="chat-messages">
@@ -230,11 +227,11 @@
                 <button class="quick-action" onclick="sendQuickMessage('World news')">🌍 World</button>
             </div>
             
-            <form class="chat-input-form" id="chat-form">
+            <form class="chat-input-form" id="chat-form" onsubmit="return false;">
                 <input type="text" class="chat-input" id="message-input" 
                        placeholder="Ask about news or chat normally..." 
                        autocomplete="off" required>
-                <button type="submit" class="send-button" id="send-button">Send</button>
+                <button type="button" class="send-button" id="send-button">Send</button>
             </form>
             
             <div class="typing-indicator" id="typing-indicator">
@@ -249,27 +246,6 @@
         const sendButton = document.getElementById('send-button');
         const chatForm = document.getElementById('chat-form');
         const typingIndicator = document.getElementById('typing-indicator');
-        const statusIndicator = document.getElementById('status');
-        const statusText = document.getElementById('status-text');
-
-        // Check system status
-        async function checkStatus() {
-            try {
-                const response = await fetch('/health');
-                const data = await response.json();
-                
-                if (data.status === 'healthy' && data.ollama === 'connected') {
-                    statusIndicator.className = 'status-indicator status-online';
-                    statusText.textContent = '🟢 Online';
-                } else {
-                    statusIndicator.className = 'status-indicator status-offline';
-                    statusText.textContent = '🔴 AI Offline';
-                }
-            } catch (error) {
-                statusIndicator.className = 'status-indicator status-offline';
-                statusText.textContent = '🔴 Offline';
-            }
-        }
 
         // Add message to chat
         function addMessage(content, isUser = false) {
@@ -300,6 +276,9 @@
             
             // Add user message
             addMessage(message, true);
+            
+            // Clear input immediately to prevent resubmission
+            messageInput.value = '';
             
             // Show typing indicator
             typingIndicator.style.display = 'block';
@@ -341,27 +320,34 @@
             messageInput.value = '';
         }
 
-        // Form submit handler
-        chatForm.addEventListener('submit', (e) => {
+        // Send button click handler
+        sendButton.addEventListener('click', (e) => {
             e.preventDefault();
             const message = messageInput.value.trim();
             if (message) {
                 sendMessage(message);
-                messageInput.value = '';
             }
+        });
+
+        // Form submit handler (backup)
+        chatForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            return false;
         });
 
         // Enter key handler
         messageInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                chatForm.dispatchEvent(new Event('submit'));
+                const message = messageInput.value.trim();
+                if (message) {
+                    sendMessage(message);
+                }
+                return false;
             }
         });
 
         // Initialize
-        checkStatus();
-        setInterval(checkStatus, 30000); // Check status every 30 seconds
         messageInput.focus();
     </script>
 </body>

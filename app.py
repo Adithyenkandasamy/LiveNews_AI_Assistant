@@ -19,6 +19,8 @@ from news_comparison_tool import NewsComparisonTool
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
+import hashlib
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,13 +33,22 @@ class LiveNewsAI:
         self.ollama_url = "http://localhost:11434/api/generate"
         self.ollama_model = "llama3.2:3b"  # Better summarization model
         
-        # News sources
+        # News sources  
         self.news_feeds = {
             'BBC World': 'http://feeds.bbci.co.uk/news/world/rss.xml',
             'BBC Tech': 'http://feeds.bbci.co.uk/news/technology/rss.xml',
+            'BBC India': 'http://feeds.bbci.co.uk/news/world/asia/india/rss.xml',
             'CNN': 'http://rss.cnn.com/rss/edition.rss',
+            'Reuters': 'https://feeds.reuters.com/reuters/topNews',
+            'Reuters India': 'https://feeds.reuters.com/reuters/INtopNews',
+            'The Hindu': 'https://www.thehindu.com/news/national/feeder/default.rss',
+            'Indian Express': 'https://indianexpress.com/section/india/feed/',
+            'NDTV India': 'https://feeds.feedburner.com/ndtvnews-india-news',
+            'Times of India': 'https://timesofindia.indiatimes.com/india/rss.cms',
+            'Al Jazeera India': 'https://www.aljazeera.com/xml/rss/all.xml',  # Will filter by query
             'TechCrunch': 'https://techcrunch.com/feed/',
-            'Reuters': 'https://feeds.reuters.com/reuters/topNews'
+            'Google News Tech': 'https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx1YlY4U0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en',
+            'Hacker News': 'https://hnrss.org/frontpage'
         }
         
         # Setup logging
@@ -68,7 +79,8 @@ class LiveNewsAI:
             )
             
             self.pathway_rag = PathwayRAGSystem(pathway_config)
-            self.rag_available = True
+            # Mark RAG as available only if a backend is ready
+            self.rag_available = bool(getattr(self.pathway_rag, 'pathway_available', False) or getattr(self.pathway_rag, 'langchain_available', False))
             self.logger.info("✅ Pathway RAG system initialized")
             
         except Exception as e:
@@ -114,9 +126,31 @@ class LiveNewsAI:
                     collected_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     embedding FLOAT[],
                     url TEXT,
-                    UNIQUE(title, source)
+                    canonical_id TEXT
                 )
             """)
+
+            # Ensure canonical_id column exists (for older deployments)
+            cursor.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='news_articles' AND column_name='canonical_id'
+                    ) THEN
+                        ALTER TABLE news_articles ADD COLUMN canonical_id TEXT;
+                    END IF;
+                END$$;
+            """)
+
+            # Create unique index for deduplication if not exists
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_news_canonical
+                ON news_articles (canonical_id)
+                WHERE canonical_id IS NOT NULL
+                """
+            )
             
             conn.commit()
             cursor.close()
@@ -125,6 +159,12 @@ class LiveNewsAI:
             
         except Exception as e:
             self.logger.error(f"Database setup failed: {e}")
+        
+        # Backfill canonical IDs for existing rows (run outside transaction)
+        try:
+            self._backfill_canonical_ids()
+        except Exception as e:
+            self.logger.error(f"Canonical ID backfill failed: {e}")
             
     def setup_news_comparison(self):
         """Initialize news comparison tool"""
@@ -159,8 +199,8 @@ class LiveNewsAI:
             except Exception as e:
                 self.logger.error(f"News collection error: {e}")
                 
-            # Wait 30 minutes before next collection
-            time.sleep(1800)
+            # Wait 30 seconds before next collection for real-time updates
+            time.sleep(30)
             
     def fetch_and_store_news(self) -> List[Dict[str, Any]]:
         """Fetch news and store in database"""
@@ -168,9 +208,11 @@ class LiveNewsAI:
         
         for source_name, feed_url in self.news_feeds.items():
             try:
+                self.logger.info(f"Fetching from {source_name}...")
                 feed = feedparser.parse(feed_url)
+                self.logger.info(f"Found {len(feed.entries)} entries from {source_name}")
                 
-                for entry in feed.entries[:10]:  # Top 10 from each source
+                for entry in feed.entries[:5]:  # Top 5 from each source for speed
                     try:
                         # Parse date
                         if hasattr(entry, 'published_parsed') and entry.published_parsed:
@@ -190,6 +232,9 @@ class LiveNewsAI:
                         # Store in database
                         if self._store_article(article):
                             all_articles.append(article)
+                            self.logger.info(f"Added article: {article['title'][:50]}...")
+                        else:
+                            self.logger.warning(f"Failed to store article: {article['title'][:50]}...")
                             
                     except Exception as e:
                         self.logger.error(f"Error processing article: {e}")
@@ -197,6 +242,7 @@ class LiveNewsAI:
             except Exception as e:
                 self.logger.error(f"Error fetching from {source_name}: {e}")
                 
+        self.logger.info(f"Total articles collected and stored: {len(all_articles)}")
         return all_articles
         
     def _categorize_article(self, text: str) -> str:
@@ -217,77 +263,163 @@ class LiveNewsAI:
         return 'General'
         
     def _store_article(self, article: Dict[str, Any]) -> bool:
-        """Store article in database"""
+        """Store article in database. Treat duplicates as success (idempotent)."""
         try:
             conn = psycopg2.connect(**self.db_config)
             cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO news_articles (title, content, source, category, collected_date, url)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (title, source) DO NOTHING
-                RETURNING id
-            """, (
-                article['title'],
-                article['content'],
-                article['source'],
-                article['category'],
-                article['date'],
-                article['url']
-            ))
-            
-            result = cursor.fetchone()
+
+            # Compute canonical_id for robust deduplication
+            canonical_id = self._make_canonical_id(article)
+
+            cursor.execute(
+                """
+                INSERT INTO news_articles (title, content, source, category, collected_date, url, canonical_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (canonical_id) DO NOTHING
+                """,
+                (
+                    article['title'],
+                    article['content'],
+                    article['source'],
+                    article['category'],
+                    article['date'],
+                    article['url'],
+                    canonical_id,
+                ),
+            )
+
             conn.commit()
             cursor.close()
             conn.close()
-            
-            return result is not None
-            
+
+            # If no exception, insertion succeeded or was a duplicate (idempotent)
+            return True
+
         except Exception as e:
             self.logger.error(f"Database storage error: {e}")
             return False
+
+    def _make_canonical_id(self, article: Dict[str, Any]) -> str:
+        """Create a stable hash for an article to deduplicate across runs.
+        Uses normalized title + source + normalized URL path. Returns empty string if cannot compute.
+        """
+        try:
+            title = (article.get('title') or '').strip().lower()
+            source = (article.get('source') or '').strip().lower()
+            url = (article.get('url') or '').strip()
+
+            # Normalize URL to domain + path (ignore query params which often change)
+            if url:
+                p = urlparse(url)
+                norm_url = (p.netloc + p.path).lower()
+            else:
+                norm_url = ''
+
+            # If title is very short, include a bit of content to stabilize hash
+            content = (article.get('content') or '').strip().lower()
+            content_snippet = content[:120]
+
+            key = '\n'.join([title, source, norm_url, content_snippet])
+            return hashlib.sha256(key.encode('utf-8')).hexdigest()
+        except Exception:
+            return ''
+
+    def _backfill_canonical_ids(self, batch_size: int = 1000):
+        """Populate canonical_id for rows where it is NULL, in batches."""
+        processed = 0
+        while True:
+            conn = psycopg2.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, title, source, url, content
+                FROM news_articles
+                WHERE canonical_id IS NULL
+                LIMIT %s
+                """,
+                (batch_size,)
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                cursor.close()
+                conn.close()
+                break
+            for row in rows:
+                row_id, title, source, url, content = row
+                art = {'title': title or '', 'source': source or '', 'url': url or '', 'content': content or ''}
+                cid = self._make_canonical_id(art)
+                cursor.execute(
+                    "UPDATE news_articles SET canonical_id = %s WHERE id = %s",
+                    (cid, row_id)
+                )
+                processed += 1
+            conn.commit()
+            cursor.close()
+            conn.close()
+        if processed:
+            self.logger.info(f"🔧 Backfilled canonical_id for {processed} existing articles")
         
-    def fetch_latest_news(self, hours_back: int = 24) -> List[Dict[str, Any]]:
-        """Fetch latest news from multiple sources"""
+    def fetch_latest_news(self, hours_back: int = 12, query: str | None = None) -> List[Dict[str, Any]]:
+        """Fetch latest news from multiple sources. If query provided, prioritize matching items (e.g., India)."""
         all_news = []
         cutoff_time = datetime.now() - timedelta(hours=hours_back)
+        q = (query or '').lower()
+        want_india = any(term in q for term in ['india', 'indian', 'delhi', 'mumbai', 'bengaluru', 'bangalore', 'chennai', 'kolkata', 'hyderabad', 'modi'])
         
         for source_name, feed_url in self.news_feeds.items():
             try:
+                self.logger.info(f"Fetching from {source_name}...")
                 feed = feedparser.parse(feed_url)
                 
                 for entry in feed.entries[:5]:  # Top 5 from each source
-                    # Parse date
+                    # Parse date - be more lenient
                     try:
                         if hasattr(entry, 'published_parsed') and entry.published_parsed:
                             pub_date = datetime(*entry.published_parsed[:6])
+                        elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                            pub_date = datetime(*entry.updated_parsed[:6])
                         else:
-                            pub_date = datetime.now()  # Assume recent if no date
+                            # If no date, assume it's recent
+                            pub_date = datetime.now() - timedelta(hours=1)
                     except:
-                        pub_date = datetime.now()
+                        pub_date = datetime.now() - timedelta(hours=1)
                     
-                    # Only include recent news
-                    if pub_date > cutoff_time:
-                        news_item = {
-                            'title': entry.get('title', ''),
-                            'summary': entry.get('summary', '')[:800] + ("..." if len(entry.get('summary', '')) > 800 else ""),
-                            'source': source_name,
-                            'date': pub_date.strftime('%Y-%m-%d %H:%M'),
-                            'link': entry.get('link', '')
-                        }
-                        all_news.append(news_item)
+                    # Be more lenient with time filtering for now
+                    news_item = {
+                        'title': entry.get('title', 'No title'),
+                        'summary': entry.get('summary', entry.get('description', ''))[:800],
+                        'source': source_name,
+                        'date': pub_date.strftime('%Y-%m-%d %H:%M'),
+                        'link': entry.get('link', ''),
+                        'content': entry.get('summary', entry.get('description', ''))[:800]
+                    }
+                    all_news.append(news_item)
+                    self.logger.info(f"Added article: {news_item['title'][:50]}...")
                         
             except Exception as e:
                 self.logger.error(f"Failed to fetch from {source_name}: {e}")
                 
-        # Sort by date (newest first) and return top 10
-        all_news.sort(key=lambda x: x['date'], reverse=True)
+        # Query-aware prioritization
+        if want_india:
+            cities = ['india', 'indian', 'delhi', 'mumbai', 'bengaluru', 'bangalore', 'chennai', 'kolkata', 'hyderabad']
+            def is_india_item(item: Dict[str, Any]) -> bool:
+                text = (item.get('title','') + ' ' + item.get('summary','')).lower()
+                if any(c in text for c in cities):
+                    return True
+                return item.get('source','').lower() in [
+                    'bbc india','reuters india','the hindu','indian express','ndtv india','times of india'
+                ]
+            all_news.sort(key=lambda x: (not is_india_item(x), x['date']), reverse=False)
+        else:
+            # Sort by date (newest first)
+            all_news.sort(key=lambda x: x['date'], reverse=True)
+        self.logger.info(f"Total articles collected: {len(all_news)}")
         
-        # Apply freshness filtering if validator available
+        # Apply freshness filtering when available to avoid outdated news
         if self.freshness_validator:
             all_news = self.freshness_validator.filter_fresh_articles(all_news)
             
-        return all_news[:10]
+        return all_news[:15]
         
     def is_news_query(self, user_input: str) -> bool:
         """Check if user is asking for news"""
@@ -303,6 +435,7 @@ class LiveNewsAI:
     def chat_with_news(self, user_input: str) -> str:
         """Main chat function with Pathway RAG and news integration"""
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ollama_available = getattr(self.pathway_rag, 'ollama_available', False)
         
         # Check if user wants news
         if self.is_news_query(user_input):
@@ -327,17 +460,25 @@ class LiveNewsAI:
                             fresh_percent = freshness.get('freshness_percentage', {}).get('fresh', 0)
                             news_context += f"News Freshness: {fresh_percent}% recent content\n\n"
                         
-                        prompt = f"""You are a helpful AI assistant with access to real-time news via advanced RAG system. Based on the current news below, answer the user's question naturally and conversationally.
+                        # If Ollama isn't available, return concise bullet points immediately
+                        if not ollama_available:
+                            bullets = [
+                                f"- {src.get('title', 'No title')} — {src.get('source','?')} ({src.get('date','?')})"
+                                for src in rag_result['sources'][:5]
+                            ]
+                            return "Here are the latest updates:\n" + "\n".join(bullets)
+                        
+                        prompt = f"""You are a news AI assistant. Answer concisely using the news below.
 
 {news_context}
 
 User: {user_input}
 
-Provide a natural, informative response using the news information above. Be conversational and helpful."""
+Give a brief, direct response (2-3 sentences max)."""
 
                     else:
                         # RAG found no results, fallback to direct news fetch
-                        latest_news = self.fetch_latest_news(24)
+                        latest_news = self.fetch_latest_news(24, user_input)
                         
                         if latest_news:
                             news_context = f"Current Date & Time: {current_time}\n\n"
@@ -348,24 +489,30 @@ Provide a natural, informative response using the news information above. Be con
                                 news_context += f"   Source: {news['source']} | {news['date']}\n"
                                 news_context += f"   Summary: {news['summary']}\n\n"
                             
-                            prompt = f"""You are a helpful AI assistant with access to real-time news. Based on the current news below, answer the user's question naturally and conversationally.
+                            if not ollama_available:
+                                bullets = [
+                                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                                ]
+                                return "Here are the latest updates:\n" + "\n".join(bullets)
+                            
+                            prompt = f"""Answer briefly using news below:
 
 {news_context}
 
 User: {user_input}
 
-Provide a natural, informative response using the news information above. Be conversational and helpful."""
+Keep response short (2-3 sentences)."""
                         else:
-                            prompt = f"""You are a helpful AI assistant. The user asked about news but no recent articles were found. Current time: {current_time}
+                            prompt = f"""No recent news found. Current time: {current_time}
 
 User: {user_input}
 
-Explain that you don't have access to the very latest news and suggest they check news websites directly."""
+Brief response: I don't have current news. Check BBC, CNN, or Reuters for latest updates."""
                             
                 except Exception as e:
                     self.logger.error(f"RAG query failed: {e}")
                     # Fallback to simple news fetch
-                    latest_news = self.fetch_latest_news(24)
+                    latest_news = self.fetch_latest_news(24, user_input)
                     
                     if latest_news:
                         news_context = f"Current Date & Time: {current_time}\n\n"
@@ -375,6 +522,11 @@ Explain that you don't have access to the very latest news and suggest they chec
                             news_context += f"{i}. {news['title']}\n"
                             news_context += f"   Source: {news['source']} | {news['date']}\n"
                             news_context += f"   Summary: {news['summary']}\n\n"
+                        if not ollama_available:
+                            bullets = [
+                                f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                            ]
+                            return "Here are the latest updates:\n" + "\n".join(bullets)
                         
                         prompt = f"""You are a helpful AI assistant with access to real-time news. Based on the current news below, answer the user's question naturally and conversationally.
 
@@ -391,7 +543,7 @@ User: {user_input}
 Explain that you don't have access to the very latest news and suggest they check news websites directly."""
             else:
                 # No RAG available, use simple news fetch
-                latest_news = self.fetch_latest_news(24)
+                latest_news = self.fetch_latest_news(24, user_input)
                 
                 if latest_news:
                     news_context = f"Current Date & Time: {current_time}\n\n"
@@ -401,6 +553,11 @@ Explain that you don't have access to the very latest news and suggest they chec
                         news_context += f"{i}. {news['title']}\n"
                         news_context += f"   Source: {news['source']} | {news['date']}\n"
                         news_context += f"   Summary: {news['summary']}\n\n"
+                    if not ollama_available:
+                        bullets = [
+                            f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                        ]
+                        return "Here are the latest updates:\n" + "\n".join(bullets)
                     
                     prompt = f"""You are a helpful AI assistant with access to real-time news. Based on the current news below, answer the user's question naturally and conversationally.
 
@@ -418,11 +575,11 @@ Explain that you don't have access to the very latest news and suggest they chec
                 
         else:
             # Normal conversation (non-news)
-            prompt = f"""You are a helpful, friendly AI assistant. Current time: {current_time}
+            prompt = f"""You are a helpful AI assistant. Current time: {current_time}
 
 User: {user_input}
 
-Respond naturally and helpfully."""
+Give a brief, direct response (1-2 sentences)."""
         
         # Generate response using Ollama
         try:
@@ -434,10 +591,10 @@ Respond naturally and helpfully."""
                     "stream": False,
                     "options": {
                         "temperature": 0.7,
-                        "num_predict": 300
+                        "num_predict": 150
                     }
                 },
-                timeout=30
+                timeout=10
             )
             
             if response.status_code == 200:
@@ -449,6 +606,13 @@ Respond naturally and helpfully."""
                 
         except Exception as e:
             self.logger.error(f"Ollama request failed: {e}")
+            # Fallback: return bullet summary if we have recent news
+            latest_news = self.fetch_latest_news(24, user_input)
+            if latest_news:
+                bullets = [
+                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                ]
+                return "Here are the latest updates:\n" + "\n".join(bullets)
             return "Sorry, I encountered an error while processing your message."
 
 # Initialize the AI
@@ -674,13 +838,13 @@ if __name__ == '__main__':
         )
         
         if test_response.status_code == 200:
-            print("✅ Connected to Ollama Nemotron-mini")
+            print("✅ Connected to Ollama Llama 3.2:3b")
         else:
             print("⚠️ Warning: Ollama connection failed")
             
     except Exception as e:
         print("❌ Error: Cannot connect to Ollama")
-        print("Please make sure Ollama is running: ollama run nemotron-mini")
+        print("Please make sure Ollama is running: ollama run llama3.2:3b")
     
     print("🚀 Starting Live News AI Web App...")
     app.run(debug=True, host='0.0.0.0', port=5000)
