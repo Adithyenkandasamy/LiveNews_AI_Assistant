@@ -27,6 +27,16 @@ requests>=2.31.0
 plotly>=5.17.0
 matplotlib>=3.7.0
 
+# RAG and Vector Database
+pathway>=0.7.0
+langchain>=0.1.0
+langchain-community>=0.0.10
+chromadb>=0.4.0
+faiss-cpu>=1.7.4
+
+# Web Framework
+flask>=2.3.0
+
 # Utilities
 python-dotenv>=1.0.0
 python-dateutil>=2.8.2
