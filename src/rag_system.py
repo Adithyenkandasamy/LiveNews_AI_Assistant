@@ -17,7 +17,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import feedparser
 from dotenv import load_dotenv
-from news_freshness_validator import NewsFreshnessValidator, FreshnessConfig
+from .freshness_validator import NewsFreshnessValidator, FreshnessConfig
 
 # LangChain imports as fallback (updated for LangChain >= 0.1 / 0.3 split)
 try:

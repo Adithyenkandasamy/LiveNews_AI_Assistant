@@ -13,10 +13,10 @@ from typing import List, Dict, Any
 import logging
 import threading
 import time
-from pathway_rag_system import PathwayRAGSystem, PathwayRAGConfig
-from news_freshness_validator import NewsFreshnessValidator, FreshnessConfig
-from news_comparison_tool import NewsComparisonTool
-from gemini_client import GeminiClient
+from src.rag_system import PathwayRAGSystem, PathwayRAGConfig
+from src.freshness_validator import NewsFreshnessValidator, FreshnessConfig
+from src.comparison_tool import NewsComparisonTool
+from src.gemini_client import GeminiClient
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
@@ -213,8 +213,8 @@ class LiveNewsAI:
             except Exception as e:
                 self.logger.error(f"News collection error: {e}")
                 
-            # Wait 30 minutes before next collection to balance freshness and load
-            time.sleep(1800)
+            # Wait 1 minute before next collection for real-time updates
+            time.sleep(60)
             
     def fetch_and_store_news(self) -> List[Dict[str, Any]]:
         """Fetch news and store in database"""
@@ -234,13 +234,21 @@ class LiveNewsAI:
                         else:
                             pub_date = datetime.now()
                             
+                        # Get full content without artificial limits
+                        full_content = entry.get('summary', '') or entry.get('description', '') or entry.get('content', '')
+                        
+                        # Validate content exists and is meaningful
+                        if not full_content or len(full_content.strip()) < 20:
+                            self.logger.warning(f"Skipping article with insufficient content: {entry.get('title', '')[:50]}...")
+                            continue
+                            
                         article = {
                             'title': entry.get('title', ''),
-                            'content': entry.get('summary', '') or entry.get('description', ''),
+                            'content': full_content,  # No artificial limit
                             'source': source_name,
                             'date': pub_date.strftime('%Y-%m-%d %H:%M:%S'),
                             'url': entry.get('link', ''),
-                            'category': self._categorize_article(entry.get('title', '') + ' ' + entry.get('summary', ''))
+                            'category': self._categorize_article(entry.get('title', '') + ' ' + full_content[:500])  # Use more content for categorization
                         }
                         
                         # Store in database
@@ -401,13 +409,37 @@ class LiveNewsAI:
                         pub_date = datetime.now() - timedelta(hours=1)
                     
                     # Be more lenient with time filtering for now
+                    # Get full content without limits
+                    full_content = entry.get('summary', '') or entry.get('description', '') or entry.get('content', '')
+                    
+                    # Skip if no meaningful content
+                    if not full_content or len(full_content.strip()) < 20:
+                        self.logger.warning(f"Skipping article with no content: {entry.get('title', '')[:50]}...")
+                        continue
+                        
+                    # Enhanced date formatting with age indication
+                    date_str = pub_date.strftime('%Y-%m-%d %H:%M')
+                    age = datetime.now() - pub_date
+                    if age.days > 7:
+                        age_indicator = f" ({age.days} days old)"
+                    elif age.days > 0:
+                        age_indicator = f" ({age.days}d ago)"
+                    elif age.seconds > 3600:
+                        hours = age.seconds // 3600
+                        age_indicator = f" ({hours}h ago)"
+                    else:
+                        age_indicator = " (recent)"
+                    
                     news_item = {
                         'title': entry.get('title', 'No title'),
-                        'summary': entry.get('summary', entry.get('description', ''))[:800],
+                        'summary': full_content,  # Full content available
                         'source': source_name,
-                        'date': pub_date.strftime('%Y-%m-%d %H:%M'),
+                        'date': date_str,
+                        'date_with_age': date_str + age_indicator,
                         'link': entry.get('link', ''),
-                        'content': entry.get('summary', entry.get('description', ''))[:800]
+                        'content': full_content,  # No artificial limit
+                        'age_days': age.days,
+                        'is_old': age.days > 3  # Mark as old if > 3 days
                     }
                     all_news.append(news_item)
                     self.logger.info(f"Added article: {news_item['title'][:50]}...")
@@ -454,6 +486,7 @@ class LiveNewsAI:
         model_available = self.model_available
         topic = self._extract_topic(user_input)
         wants_summary = self._wants_summary(user_input)
+        wants_full_text = self._wants_full_text(user_input)
         
         # Check if user wants news
         if self.is_news_query(user_input):
@@ -494,9 +527,36 @@ class LiveNewsAI:
                                     return datetime.min
                         sorted_sources = sorted(rag_result['sources'], key=lambda s: _parse_dt(str(s.get('date',''))), reverse=True)
                         for i, source in enumerate(sorted_sources[:5], 1):
-                            news_context += f"{i}. {source.get('title', 'No title')}\n"
-                            news_context += f"   Source: {source.get('source', 'Unknown')} | {source.get('date', 'Unknown date')}\n"
-                            news_context += f"   Summary: {source.get('content', '')[:800]}...\n\n"
+                            title = source.get('title', 'No title')
+                            content = source.get('content', '')
+                            
+                            # Check for missing content
+                            if not content or len(content.strip()) < 20:
+                                content = "[Content not available or too brief]"
+                            
+                            # Enhanced date display with age
+                            date_info = source.get('date', 'Unknown date')
+                            try:
+                                source_date = datetime.strptime(date_info, '%Y-%m-%d %H:%M')
+                                age = datetime.now() - source_date
+                                if age.days > 7:
+                                    age_str = f" ({age.days} days old - may be outdated)"
+                                elif age.days > 3:
+                                    age_str = f" ({age.days} days ago)"
+                                elif age.days > 0:
+                                    age_str = f" ({age.days}d ago)"
+                                else:
+                                    age_str = " (recent)"
+                                date_display = date_info + age_str
+                            except:
+                                date_display = date_info
+                                
+                            news_context += f"{i}. {title}\n"
+                            news_context += f"   Source: {source.get('source', 'Unknown')} | {date_display}\n"
+                            # Add clickable link if available
+                            if source.get('url'):
+                                news_context += f"   Link: {source.get('url')}\n"
+                            news_context += f"   Content: {content}\n\n"  # Full content, no truncation
                         
                         # Add freshness info if available
                         if rag_result.get('freshness_report'):
@@ -506,19 +566,35 @@ class LiveNewsAI:
                         
                         # If Gemini isn't available, return concise bullet points immediately
                         if wants_summary or not self.model_available:
-                            bullets = [
-                                f"- {src.get('title', 'No title')} — {src.get('source','?')} ({src.get('date','?')})"
-                                for src in sorted_sources[:3]
-                            ]
+                            bullets = []
+                            for src in sorted_sources[:3]:
+                                title = src.get('title', 'No title')
+                                source = src.get('source', '?')
+                                date = src.get('date', '?')
+                                link = src.get('url', '')
+                                bullet = f"- {title} — {source} ({date})"
+                                if link:
+                                    bullet += f"\n  Read more: {link}"
+                                bullets.append(bullet)
                             return "Here are the latest updates:\n" + "\n".join(bullets)
                         
-                        prompt = f"""You are a news AI assistant. Answer concisely using the news below.
+                        # Enhanced prompt with link instructions
+                        if wants_full_text:
+                            prompt = f"""You are a news AI assistant. Provide detailed information using the news below. Include relevant links for users to read the full articles.
 
 {news_context}
 
 User: {user_input}
 
-Give a brief, direct response (2-3 sentences max)."""
+Provide a comprehensive response with details and encourage users to click the links for full articles."""
+                        else:
+                            prompt = f"""You are a news AI assistant. Answer concisely using the news below. Always mention that links are available for full articles.
+
+{news_context}
+
+User: {user_input}
+
+Give a brief, direct response (2-3 sentences max) and remind users they can click the links for full articles."""
 
                     else:
                         # RAG found no results, fallback to direct news fetch
@@ -529,22 +605,50 @@ Give a brief, direct response (2-3 sentences max)."""
                             news_context += "Latest News Headlines:\n"
                             
                             for i, news in enumerate(latest_news[:5], 1):
-                                news_context += f"{i}. {news['title']}\n"
-                                news_context += f"   Source: {news['source']} | {news['date']}\n"
-                                news_context += f"   Summary: {news['summary']}\n\n"
+                                # Check for missing content
+                                summary = news.get('summary', '')
+                                if not summary or len(summary.strip()) < 20:
+                                    summary = "[No content available for this article]"
+                                
+                                # Use enhanced date display if available
+                                date_display = news.get('date_with_age', news.get('date', 'Unknown date'))
+                                
+                                # Add warning for old content
+                                warning = ""
+                                if news.get('is_old', False):
+                                    warning = " ⚠️ OLD NEWS"
+                                    
+                                news_context += f"{i}. {news['title']}{warning}\n"
+                                news_context += f"   Source: {news['source']} | {date_display}\n"
+                                # Add clickable link if available
+                                if news.get('link'):
+                                    news_context += f"   Link: {news['link']}\n"
+                                news_context += f"   Content: {summary}\n\n"
                             if wants_summary or not self.model_available:
-                                bullets = [
-                                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
-                                ]
+                                bullets = []
+                                for n in latest_news[:3]:
+                                    bullet = f"- {n['title']} — {n['source']} ({n['date']})"
+                                    if n.get('link'):
+                                        bullet += f"\n  Read more: {n['link']}"
+                                    bullets.append(bullet)
                                 return "Here are the latest updates:\n" + "\n".join(bullets)
                             
-                            prompt = f"""Answer briefly using news below:
+                            if wants_full_text:
+                                prompt = f"""Provide detailed analysis using the news below. Include information about article links for readers who want the complete stories.
 
 {news_context}
 
 User: {user_input}
 
-Keep response short (2-3 sentences)."""
+Provide comprehensive coverage and mention the article links."""
+                            else:
+                                prompt = f"""Answer briefly using news below. Remind users that full article links are provided.
+
+{news_context}
+
+User: {user_input}
+
+Keep response short (2-3 sentences) but mention the article links."""
                         else:
                             # If user asked about a specific topic/location and nothing found, respond clearly
                             if topic:
@@ -648,9 +752,12 @@ Give a brief, direct response (1-2 sentences)."""
             # Fallback: return bullet summary if we have recent news
             latest_news = self.fetch_latest_news(24, user_input)
             if latest_news:
-                bullets = [
-                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
-                ]
+                bullets = []
+                for n in latest_news[:3]:
+                    bullet = f"- {n['title']} — {n['source']} ({n['date']})"
+                    if n.get('link'):
+                        bullet += f"\n  Read full article: {n['link']}"
+                    bullets.append(bullet)
                 return "Here are the latest updates:\n" + "\n".join(bullets)
             # If user asked for a specific topic and nothing found, respond clearly
             if topic:
@@ -701,6 +808,13 @@ Give a brief, direct response (1-2 sentences)."""
             return False
         tl = text.lower()
         return any(k in tl for k in ['summary', 'summarised', 'summarized', 'brief', 'short'])
+    
+    def _wants_full_text(self, text: str) -> bool:
+        """Detect if the user wants full article text."""
+        if not text:
+            return False
+        tl = text.lower()
+        return any(k in tl for k in ['full text', 'full article', 'complete article', 'entire article', 'full content', 'whole article'])
 
 # Initialize the AI
 news_ai = LiveNewsAI()

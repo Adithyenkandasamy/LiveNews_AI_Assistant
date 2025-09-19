@@ -6,8 +6,8 @@ Shows exactly what news is being retrieved and filters old content
 import logging
 from datetime import datetime
 from typing import List, Dict, Any
-from pathway_rag_system import PathwayRAGSystem, PathwayRAGConfig
-from news_freshness_validator import NewsFreshnessValidator
+from .rag_system import PathwayRAGSystem, PathwayRAGConfig
+from .freshness_validator import NewsFreshnessValidator
 import json
 
 class NewsComparisonTool:
