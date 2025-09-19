@@ -35,8 +35,7 @@ load_dotenv()
 @dataclass
 class PathwayRAGConfig:
     """Configuration for Pathway RAG system"""
-    ollama_url: str = "http://localhost:11434/api/generate"
-    ollama_model: str = "llama3.2:3b"
+    gemini_client: Any = None
     embedding_model: str = "all-MiniLM-L6-v2"
     chunk_size: int = 512
     chunk_overlap: int = 50
@@ -63,8 +62,7 @@ class PathwayRAGSystem:
         
         # Initialize news freshness validator
         freshness_config = FreshnessConfig(
-            ollama_url=config.ollama_url,
-            ollama_model=config.ollama_model
+            gemini_client=config.gemini_client
         )
         self.freshness_validator = NewsFreshnessValidator(freshness_config)
         
@@ -85,40 +83,33 @@ class PathwayRAGSystem:
         """Setup PostgreSQL connection"""
         self.db_config = {
             'host': os.getenv('DB_HOST', 'localhost'),
-            'database': os.getenv('DB_NAME', 'livenews'),
+            'database': os.getenv('DB_NAME', 'news_rag'),
             'user': os.getenv('DB_USER', 'postgres'),
             'password': os.getenv('DB_PASSWORD', 'password'),
             'port': os.getenv('DB_PORT', '5432')
         }
+        # Soft flags for pgvector capability (evaluated lazily when needed)
+        self._pgvector_checked = False
+        self._pgvector_available = False
+        self._vector_column_ready = False
         
     def init_models(self):
-        """Initialize embedding model and test Ollama connection"""
+        """Initialize embedding model and test Gemini connection"""
         # Initialize embedder
         self.embedder = SentenceTransformer(self.config.embedding_model)
         self.logger.info(f"✅ Loaded embedding model: {self.config.embedding_model}")
         
-        # Test Ollama connection
-        try:
-            test_response = requests.post(
-                self.config.ollama_url,
-                json={
-                    "model": self.config.ollama_model,
-                    "prompt": "Hello",
-                    "stream": False
-                },
-                timeout=5
-            )
-            
-            if test_response.status_code == 200:
-                self.logger.info("✅ Connected to Ollama Llama 3.2:3b successfully")
-                self.ollama_available = True
+        # Test Gemini connection
+        if self.config.gemini_client and self.config.gemini_client.available:
+            if self.config.gemini_client.test_connection():
+                self.logger.info("✅ Connected to Gemini successfully")
+                self.gemini_available = True
             else:
-                self.logger.error(f"Ollama connection failed: {test_response.status_code}")
-                self.ollama_available = False
-                
-        except Exception as e:
-            self.logger.error(f"Failed to connect to Ollama: {e}")
-            self.ollama_available = False
+                self.logger.error("Gemini connection test failed")
+                self.gemini_available = False
+        else:
+            self.logger.error("Gemini client not available")
+            self.gemini_available = False
             
     def setup_pathway_pipeline(self):
         """Setup Pathway data processing pipeline. If it fails, fall back to LangChain."""
@@ -261,11 +252,87 @@ class PathwayRAGSystem:
             
     def _store_in_database(self, article_data: Dict[str, Any]):
         """Store article data in PostgreSQL"""
+        # First ensure schema is ready (separate transaction)
+        self._ensure_database_schema()
+        
+        # Then insert data (separate transaction)
         try:
             conn = psycopg2.connect(**self.db_config)
             cursor = conn.cursor()
             
-            # Create table if not exists
+            # Check if we can use vector column
+            self._check_pgvector_capabilities()
+            
+            # Insert article with appropriate columns
+            if self._pgvector_available and self._vector_column_ready:
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO pathway_articles (title, content, source, date, category, embedding, embedding_vec)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
+                        """,
+                        (
+                            article_data['title'],
+                            article_data['content'],
+                            article_data['source'],
+                            article_data['date'],
+                            article_data['category'],
+                            article_data['embedding'],
+                            article_data['embedding'],
+                        )
+                    )
+                except Exception as vec_err:
+                    # Rollback and try witwhout vector
+                    conn.rollback()
+                    cursor.execute(
+                        """
+                        INSERT INTO pathway_articles (title, content, source, date, category, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            article_data['title'],
+                            article_data['content'],
+                            article_data['source'],
+                            article_data['date'],
+                            article_data['category'],
+                            article_data['embedding']
+                        )
+                    )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO pathway_articles (title, content, source, date, category, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        article_data['title'],
+                        article_data['content'],
+                        article_data['source'],
+                        article_data['date'],
+                        article_data['category'],
+                        article_data['embedding']
+                    )
+                )
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            if 'conn' in locals():
+                conn.rollback()
+                conn.close()
+            import traceback
+            traceback.print_exc()
+            self.logger.error(f"Database storage failed: {e}")
+            
+    def _ensure_database_schema(self):
+        """Ensure database schema exists (separate transaction)"""
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            # Create base table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS pathway_articles (
                     id SERIAL PRIMARY KEY,
@@ -278,27 +345,73 @@ class PathwayRAGSystem:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Insert article
-            cursor.execute("""
-                INSERT INTO pathway_articles (title, content, source, date, category, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (
-                article_data['title'],
-                article_data['content'],
-                article_data['source'],
-                article_data['date'],
-                article_data['category'],
-                article_data['embedding']
-            ))
-            
             conn.commit()
             cursor.close()
             conn.close()
             
+            # Try pgvector in separate transaction
+            try:
+                conn = psycopg2.connect(**self.db_config)
+                cursor = conn.cursor()
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                cursor.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name='pathway_articles' AND column_name='embedding_vec'
+                        ) THEN
+                            ALTER TABLE pathway_articles ADD COLUMN embedding_vec vector(384);
+                        END IF;
+                    END$$;
+                    """
+                )
+                conn.commit()
+                cursor.close()
+                conn.close()
+            except Exception:
+                # pgvector not available, that's ok
+                if 'conn' in locals():
+                    conn.rollback()
+                    conn.close()
+                pass
+                
         except Exception as e:
-            self.logger.error(f"Database storage failed: {e}")
+            if 'conn' in locals():
+                conn.rollback()
+                conn.close()
+            self.logger.error(f"Schema setup failed: {e}")
             
+    def _check_pgvector_capabilities(self) -> None:
+        """Check once whether pgvector extension and vector column are available."""
+        if self._pgvector_checked:
+            return
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='vector')")
+            self._pgvector_available = bool(cursor.fetchone()[0])
+            if self._pgvector_available:
+                cursor.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='pathway_articles' AND column_name='embedding_vec'
+                    )
+                    """
+                )
+                self._vector_column_ready = bool(cursor.fetchone()[0])
+            else:
+                self._vector_column_ready = False
+            cursor.close()
+            conn.close()
+        except Exception:
+            self._pgvector_available = False
+            self._vector_column_ready = False
+        finally:
+            self._pgvector_checked = True
+
     def search_similar_articles(self, query: str, limit: int = None) -> List[Dict[str, Any]]:
         """Search for similar articles using RAG with freshness filtering"""
         limit = limit or self.config.max_results
@@ -323,29 +436,95 @@ class PathwayRAGSystem:
         try:
             # Generate query embedding
             query_embedding = self.generate_embedding(query)
-            
-            # Search in database using cosine similarity
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
-            # Use PostgreSQL's array operations for similarity
-            cursor.execute("""
-                SELECT title, content, source, date, category,
-                       (1 - (embedding <=> %s::float[])) as similarity
-                FROM pathway_articles
-                WHERE (1 - (embedding <=> %s::float[])) > %s
-                ORDER BY similarity DESC
-                LIMIT %s
-            """, (query_embedding, query_embedding, self.config.similarity_threshold, limit))
-            
-            results = cursor.fetchall()
-            cursor.close()
-            conn.close()
-            
-            return [dict(row) for row in results]
+
+            # Check pgvector capability once
+            self._check_pgvector_capabilities()
+
+            if self._pgvector_available and self._vector_column_ready:
+                # Use DB-side similarity with pgvector
+                try:
+                    conn = psycopg2.connect(**self.db_config)
+                    cursor = conn.cursor(cursor_factory=RealDictCursor)
+                    cursor.execute(
+                        """
+                        SELECT title, content, source, date, category,
+                               (1 - (embedding_vec <=> %s::vector)) as similarity
+                        FROM pathway_articles
+                        WHERE embedding_vec IS NOT NULL
+                        ORDER BY similarity DESC
+                        LIMIT %s
+                        """,
+                        (query_embedding, limit)
+                    )
+                    results = cursor.fetchall()
+                    cursor.close()
+                    conn.close()
+                    return [dict(row) for row in results]
+                except Exception as sql_err:
+                    # If anything goes wrong, gracefully fall back to Python similarity
+                    self.logger.warning(f"DB-side similarity not available, falling back to Python. Error: {sql_err}")
+                    return self._search_with_python_similarity(query_embedding, limit)
+            else:
+                # No pgvector support; use Python similarity
+                return self._search_with_python_similarity(query_embedding, limit)
             
         except Exception as e:
             self.logger.error(f"Pathway search failed: {e}")
+            return []
+
+    def _search_with_python_similarity(self, query_embedding: List[float], limit: int) -> List[Dict[str, Any]]:
+        """Fallback similarity search using Python cosine similarity on embeddings stored as FLOAT[]."""
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            # Fetch a reasonable window of recent rows to keep it fast
+            cursor.execute(
+                """
+                SELECT title, content, source, date, category, embedding
+                FROM pathway_articles
+                WHERE embedding IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1000
+                """
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            if not rows:
+                return []
+
+            # Normalize query vector
+            q = np.array(query_embedding, dtype=np.float32)
+            q_norm = np.linalg.norm(q) + 1e-8
+            q = q / q_norm
+
+            scored = []
+            for r in rows:
+                emb = np.array(r.get('embedding') or [], dtype=np.float32)
+                if emb.size == 0:
+                    continue
+                emb_norm = np.linalg.norm(emb) + 1e-8
+                emb = emb / emb_norm
+                sim = float(np.dot(q, emb))
+                item = {k: r[k] for k in ['title', 'content', 'source', 'date', 'category']}
+                item['similarity'] = sim
+                scored.append(item)
+
+            # Sort by similarity desc, then by recency if date parsable
+            def _parse_dt(d):
+                try:
+                    return datetime.strptime(d, '%Y-%m-%d %H:%M')
+                except Exception:
+                    try:
+                        return datetime.strptime(d, '%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        return datetime.min
+
+            scored.sort(key=lambda x: (x['similarity'], _parse_dt(str(x.get('date','')))), reverse=True)
+            return scored[:limit]
+        except Exception as e:
+            self.logger.error(f"Python similarity fallback failed: {e}")
             return []
             
     def _search_with_langchain(self, query: str, limit: int) -> List[Dict[str, Any]]:
@@ -372,10 +551,10 @@ class PathwayRAGSystem:
             return []
             
     def generate_rag_response(self, query: str, context_articles: List[Dict[str, Any]]) -> str:
-        """Generate response using RAG with Ollama"""
-        if not self.ollama_available:
+        """Generate response using RAG with Gemini"""
+        if not self.gemini_available:
             return "AI model not available for response generation."
-            
+        
         # Build context from articles
         context = "Relevant News Articles:\n\n"
         for i, article in enumerate(context_articles[:3], 1):
@@ -394,27 +573,12 @@ User Question: {query}
 Please provide a detailed, informative response based on the news articles above."""
 
         try:
-            response = requests.post(
-                self.config.ollama_url,
-                json={
-                    "model": self.config.ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.7,
-                        "num_predict": 400
-                    }
-                },
-                timeout=30
+            answer = self.config.gemini_client.generate_response(
+                prompt,
+                max_tokens=220,
+                temperature=0.7
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get('response', '').strip()
-                return answer if answer else "I couldn't generate a response based on the available information."
-            else:
-                self.logger.error(f"Ollama response failed: {response.status_code}")
-                return "Sorry, I encountered an error while generating the response."
+            return answer if answer else "I couldn't generate a response based on the available information."
                 
         except Exception as e:
             self.logger.error(f"RAG response generation failed: {e}")
@@ -446,6 +610,56 @@ Please provide a detailed, informative response based on the news articles above
             'num_sources': len(relevant_articles),
             'freshness_report': freshness_report
         }
+
+    def has_recent_news(self, topic: str, hours: int = 12, min_similarity: float = 0.5) -> bool:
+        """Return True if there is at least one recent article about the topic meeting similarity threshold.
+        Uses fast vector similarity. Applies freshness filtering for given time window.
+        """
+        try:
+            # First, fetch more results than needed and then filter by time via freshness validator
+            raw = []
+            if getattr(self, "pathway_available", False):
+                raw = self._search_with_pathway(topic, limit=20)
+            elif getattr(self, "langchain_available", False):
+                raw = self._search_with_langchain(topic, limit=20)
+            else:
+                return False
+
+            if not raw:
+                return False
+
+            # Filter by similarity threshold
+            candidates = [r for r in raw if float(r.get('similarity', 0.0)) >= min_similarity]
+            if not candidates:
+                return False
+
+            # Time window filtering
+            cutoff = datetime.now() - timedelta(hours=hours)
+            fresh = []
+            for r in candidates:
+                d = str(r.get('date', ''))
+                dt = None
+                for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S'):
+                    try:
+                        dt = datetime.strptime(d, fmt)
+                        break
+                    except Exception:
+                        continue
+                if dt is None:
+                    # If no date, keep but treat as less reliable; let freshness validator handle it
+                    fresh.append(r)
+                else:
+                    if dt >= cutoff:
+                        fresh.append(r)
+
+            if not fresh:
+                # As a secondary check, use freshness validator across all candidates
+                fresh = self.freshness_validator.filter_fresh_articles(candidates)
+
+            return len(fresh) > 0
+        except Exception as e:
+            self.logger.error(f"has_recent_news failed: {e}")
+            return False
 
 def main():
     """Test the Pathway RAG system"""

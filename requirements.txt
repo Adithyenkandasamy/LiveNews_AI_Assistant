@@ -14,6 +14,9 @@ bitsandbytes>=0.41.0
 # torch-audio>=2.0.0
 # torchaudio>=2.0.0
 
+# Google Gemini API
+google-generativeai>=0.3.0
+
 # Optional: OpenAI API (uncomment if using)
 # openai>=1.0.0
 

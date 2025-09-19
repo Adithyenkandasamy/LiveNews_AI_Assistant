@@ -22,8 +22,7 @@ class FreshnessConfig:
     max_age_hours: int = 72  # 3 days max for "recent" news
     stale_threshold_days: int = 30  # Mark as stale after 30 days
     breaking_news_hours: int = 6  # Breaking news window
-    ollama_url: str = "http://localhost:11434/api/generate"
-    ollama_model: str = "llama3.2:3b"
+    gemini_client: Any = None
 
 class NewsFreshnessValidator:
     """
@@ -155,40 +154,29 @@ Respond in JSON format:
 }}"""
 
         try:
-            response = requests.post(
-                self.config.ollama_url,
-                json={
-                    "model": self.config.ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.1,
-                        "num_predict": 200
-                    }
-                },
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                ai_response = result.get('response', '').strip()
+            if not self.config.gemini_client or not self.config.gemini_client.available:
+                return {"is_current": True, "confidence": 0.3, "reason": "Gemini unavailable"}
                 
-                # Try to parse JSON response
-                try:
-                    import json
-                    ai_analysis = json.loads(ai_response)
-                    return ai_analysis
-                except json.JSONDecodeError:
-                    # Fallback analysis
-                    return {
-                        "is_current": "recent" in ai_response.lower(),
-                        "is_old_recycled": "old" in ai_response.lower(),
-                        "estimated_date": current_date,
-                        "confidence": 0.5,
-                        "reason": "AI parsing failed"
-                    }
-            else:
-                return {"is_current": True, "confidence": 0.3, "reason": "AI unavailable"}
+            ai_response = self.config.gemini_client.generate_response(
+                prompt,
+                max_tokens=200,
+                temperature=0.1
+            )
+                
+            # Try to parse JSON response
+            try:
+                import json
+                ai_analysis = json.loads(ai_response)
+                return ai_analysis
+            except json.JSONDecodeError:
+                # Fallback analysis
+                return {
+                    "is_current": "recent" in ai_response.lower(),
+                    "is_old_recycled": "old" in ai_response.lower(),
+                    "estimated_date": current_date,
+                    "confidence": 0.5,
+                    "reason": "AI parsing failed"
+                }
                 
         except Exception as e:
             self.logger.error(f"AI validation failed: {e}")

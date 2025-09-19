@@ -16,6 +16,7 @@ import time
 from pathway_rag_system import PathwayRAGSystem, PathwayRAGConfig
 from news_freshness_validator import NewsFreshnessValidator, FreshnessConfig
 from news_comparison_tool import NewsComparisonTool
+from gemini_client import GeminiClient
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
@@ -30,8 +31,13 @@ class LiveNewsAI:
     """Real-time news AI chatbot"""
     
     def __init__(self):
+        # Initialize Gemini client
+        self.gemini_client = GeminiClient(os.getenv('APP_GEMINI_MODEL', 'gemini-2.0-flash'))
+        self.model_available = self.gemini_client.available
+        
+        # Keep ollama config for backward compatibility (will be removed)
         self.ollama_url = "http://localhost:11434/api/generate"
-        self.ollama_model = "llama3.2:3b"  # Better summarization model
+        self.ollama_model = "llama3.2:3b"
         
         # News sources  
         self.news_feeds = {
@@ -71,8 +77,7 @@ class LiveNewsAI:
         try:
             # Setup Pathway RAG
             pathway_config = PathwayRAGConfig(
-                ollama_url=self.ollama_url,
-                ollama_model=self.ollama_model,
+                gemini_client=self.gemini_client,
                 embedding_model='all-MiniLM-L6-v2',
                 chunk_size=512,
                 max_results=5
@@ -90,8 +95,7 @@ class LiveNewsAI:
         # Setup freshness validator
         try:
             freshness_config = FreshnessConfig(
-                ollama_url=self.ollama_url,
-                ollama_model=self.ollama_model
+                gemini_client=self.gemini_client
             )
             self.freshness_validator = NewsFreshnessValidator(freshness_config)
             self.logger.info("✅ News freshness validator initialized")
@@ -143,12 +147,22 @@ class LiveNewsAI:
                 END$$;
             """)
 
-            # Create unique index for deduplication if not exists
+            # Ensure canonical_id empty strings are normalized to NULL for uniqueness
+            cursor.execute("UPDATE news_articles SET canonical_id = NULL WHERE canonical_id = ''")
+
+            # Create a proper UNIQUE constraint usable by ON CONFLICT
             cursor.execute(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_news_canonical
-                ON news_articles (canonical_id)
-                WHERE canonical_id IS NOT NULL
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.table_constraints 
+                        WHERE table_name = 'news_articles' AND constraint_name = 'uniq_news_canonical'
+                    ) THEN
+                        ALTER TABLE news_articles
+                        ADD CONSTRAINT uniq_news_canonical UNIQUE (canonical_id);
+                    END IF;
+                END$$;
                 """
             )
             
@@ -199,8 +213,8 @@ class LiveNewsAI:
             except Exception as e:
                 self.logger.error(f"News collection error: {e}")
                 
-            # Wait 30 seconds before next collection for real-time updates
-            time.sleep(30)
+            # Wait 30 minutes before next collection to balance freshness and load
+            time.sleep(1800)
             
     def fetch_and_store_news(self) -> List[Dict[str, Any]]:
         """Fetch news and store in database"""
@@ -270,12 +284,14 @@ class LiveNewsAI:
 
             # Compute canonical_id for robust deduplication
             canonical_id = self._make_canonical_id(article)
+            if not canonical_id:
+                canonical_id = None
 
             cursor.execute(
                 """
                 INSERT INTO news_articles (title, content, source, category, collected_date, url, canonical_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (canonical_id) DO NOTHING
+                ON CONFLICT ON CONSTRAINT uniq_news_canonical DO NOTHING
                 """,
                 (
                     article['title'],
@@ -435,13 +451,31 @@ class LiveNewsAI:
     def chat_with_news(self, user_input: str) -> str:
         """Main chat function with Pathway RAG and news integration"""
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ollama_available = getattr(self.pathway_rag, 'ollama_available', False)
+        model_available = self.model_available
+        topic = self._extract_topic(user_input)
+        wants_summary = self._wants_summary(user_input)
         
         # Check if user wants news
         if self.is_news_query(user_input):
             # Try Pathway RAG first for better results
             if self.rag_available:
                 try:
+                    # Fast existence check using private Pathway RAG method
+                    if topic:
+                        try:
+                            has_any = self.pathway_rag.has_recent_news(topic, hours=24, min_similarity=0.5)
+                        except Exception:
+                            has_any = True  # fail open to avoid blocking
+                        # For existence-style questions, reply immediately with yes/no using Pathway-only check
+                        if self._is_existence_query(user_input):
+                            return (
+                                f"Yes, there are recent updates on {topic}."
+                                if has_any else
+                                f"No hot news recently on {topic}."
+                            )
+                        if not has_any and topic:  # Only return "no news" if specific topic was requested
+                            return f"No hot news recently on {topic}."
+
                     rag_result = self.pathway_rag.query(user_input)
                     
                     if rag_result['sources']:
@@ -449,7 +483,17 @@ class LiveNewsAI:
                         news_context = f"Current Date & Time: {current_time}\n\n"
                         news_context += "Relevant News (via Pathway RAG):\n"
                         
-                        for i, source in enumerate(rag_result['sources'][:5], 1):
+                        # Sort sources by recency when possible
+                        def _parse_dt(d):
+                            try:
+                                return datetime.strptime(d, '%Y-%m-%d %H:%M')
+                            except Exception:
+                                try:
+                                    return datetime.strptime(d, '%Y-%m-%d %H:%M:%S')
+                                except Exception:
+                                    return datetime.min
+                        sorted_sources = sorted(rag_result['sources'], key=lambda s: _parse_dt(str(s.get('date',''))), reverse=True)
+                        for i, source in enumerate(sorted_sources[:5], 1):
                             news_context += f"{i}. {source.get('title', 'No title')}\n"
                             news_context += f"   Source: {source.get('source', 'Unknown')} | {source.get('date', 'Unknown date')}\n"
                             news_context += f"   Summary: {source.get('content', '')[:800]}...\n\n"
@@ -460,11 +504,11 @@ class LiveNewsAI:
                             fresh_percent = freshness.get('freshness_percentage', {}).get('fresh', 0)
                             news_context += f"News Freshness: {fresh_percent}% recent content\n\n"
                         
-                        # If Ollama isn't available, return concise bullet points immediately
-                        if not ollama_available:
+                        # If Gemini isn't available, return concise bullet points immediately
+                        if wants_summary or not self.model_available:
                             bullets = [
                                 f"- {src.get('title', 'No title')} — {src.get('source','?')} ({src.get('date','?')})"
-                                for src in rag_result['sources'][:5]
+                                for src in sorted_sources[:3]
                             ]
                             return "Here are the latest updates:\n" + "\n".join(bullets)
                         
@@ -488,10 +532,9 @@ Give a brief, direct response (2-3 sentences max)."""
                                 news_context += f"{i}. {news['title']}\n"
                                 news_context += f"   Source: {news['source']} | {news['date']}\n"
                                 news_context += f"   Summary: {news['summary']}\n\n"
-                            
-                            if not ollama_available:
+                            if wants_summary or not self.model_available:
                                 bullets = [
-                                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
                                 ]
                                 return "Here are the latest updates:\n" + "\n".join(bullets)
                             
@@ -503,6 +546,9 @@ User: {user_input}
 
 Keep response short (2-3 sentences)."""
                         else:
+                            # If user asked about a specific topic/location and nothing found, respond clearly
+                            if topic:
+                                return f"No hot news recently on {topic}."
                             prompt = f"""No recent news found. Current time: {current_time}
 
 User: {user_input}
@@ -522,9 +568,9 @@ Brief response: I don't have current news. Check BBC, CNN, or Reuters for latest
                             news_context += f"{i}. {news['title']}\n"
                             news_context += f"   Source: {news['source']} | {news['date']}\n"
                             news_context += f"   Summary: {news['summary']}\n\n"
-                        if not ollama_available:
+                        if wants_summary or not ollama_available:
                             bullets = [
-                                f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                                f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
                             ]
                             return "Here are the latest updates:\n" + "\n".join(bullets)
                         
@@ -536,6 +582,8 @@ User: {user_input}
 
 Provide a natural, informative response using the news information above. Be conversational and helpful."""
                     else:
+                        if topic:
+                            return f"No hot news recently on {topic}."
                         prompt = f"""You are a helpful AI assistant. The user asked about news but no recent articles were found. Current time: {current_time}
 
 User: {user_input}
@@ -553,9 +601,9 @@ Explain that you don't have access to the very latest news and suggest they chec
                         news_context += f"{i}. {news['title']}\n"
                         news_context += f"   Source: {news['source']} | {news['date']}\n"
                         news_context += f"   Summary: {news['summary']}\n\n"
-                    if not ollama_available:
+                    if not self.model_available:
                         bullets = [
-                            f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                            f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
                         ]
                         return "Here are the latest updates:\n" + "\n".join(bullets)
                     
@@ -567,6 +615,8 @@ User: {user_input}
 
 Provide a natural, informative response using the news information above. Be conversational and helpful."""
                 else:
+                    if topic:
+                        return f"No hot news recently on {topic}."
                     prompt = f"""You are a helpful AI assistant. The user asked about news but no recent articles were found. Current time: {current_time}
 
 User: {user_input}
@@ -581,39 +631,76 @@ User: {user_input}
 
 Give a brief, direct response (1-2 sentences)."""
         
-        # Generate response using Ollama
+        # Generate response using Gemini
         try:
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.7,
-                        "num_predict": 150
-                    }
-                },
-                timeout=10
+            if not self.model_available:
+                return "Sorry, AI model is not available right now."
+                
+            answer = self.gemini_client.generate_response(
+                prompt, 
+                max_tokens=120, 
+                temperature=0.7
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get('response', '').strip()
-                return answer if answer else "I'm not sure how to respond to that."
-            else:
-                return "Sorry, I'm having trouble connecting to my AI model right now."
+            return answer if answer else "I'm not sure how to respond to that."
                 
         except Exception as e:
-            self.logger.error(f"Ollama request failed: {e}")
+            self.logger.error(f"Gemini request failed: {e}")
             # Fallback: return bullet summary if we have recent news
             latest_news = self.fetch_latest_news(24, user_input)
             if latest_news:
                 bullets = [
-                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:5]
+                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
                 ]
                 return "Here are the latest updates:\n" + "\n".join(bullets)
+            # If user asked for a specific topic and nothing found, respond clearly
+            if topic:
+                return f"No hot news recently on {topic}."
             return "Sorry, I encountered an error while processing your message."
+
+    def _extract_topic(self, text: str) -> str | None:
+        """Extract a specific topic from user query only when explicitly mentioned.
+        Returns normalized name only for very specific topic requests, else None.
+        """
+        if not text:
+            return None
+        t = text.lower()
+        
+        # Only extract topic if user explicitly mentions it with specific context
+        specific_patterns = [
+            ('karnataka', ['karnataka news', 'news from karnataka', 'about karnataka']),
+            ('bengaluru', ['bengaluru news', 'bangalore news', 'news from bengaluru', 'news from bangalore']),
+            ('india', ['india news', 'indian news', 'news from india', 'about india']),
+            ('delhi', ['delhi news', 'news from delhi', 'about delhi']),
+            ('mumbai', ['mumbai news', 'news from mumbai', 'about mumbai']),
+            ('technology', ['technology news', 'tech news', 'about technology', 'tech updates']),
+            ('politics', ['political news', 'politics news', 'about politics', 'political updates']),
+            ('business', ['business news', 'economic news', 'about business', 'market news']),
+            ('sports', ['sports news', 'about sports', 'sports updates']),
+            ('health', ['health news', 'medical news', 'about health']),
+            ('science', ['science news', 'scientific news', 'about science'])
+        ]
+        
+        for topic, patterns in specific_patterns:
+            if any(pattern in t for pattern in patterns):
+                return topic.capitalize()
+        return None
+
+    def _is_existence_query(self, text: str) -> bool:
+        """Detect if the user is asking whether there is any news about a topic (yes/no intent)."""
+        if not text:
+            return False
+        tl = text.lower()
+        patterns = [
+            'any news', 'hot news', 'is there news', 'is there any news', 'updates on', 'anything new', 'recent news', 'latest on'
+        ]
+        return any(p in tl for p in patterns)
+
+    def _wants_summary(self, text: str) -> bool:
+        """Detect if the user asked for a brief/summarized response."""
+        if not text:
+            return False
+        tl = text.lower()
+        return any(k in tl for k in ['summary', 'summarised', 'summarized', 'brief', 'short'])
 
 # Initialize the AI
 news_ai = LiveNewsAI()
@@ -844,7 +931,7 @@ if __name__ == '__main__':
             
     except Exception as e:
         print("❌ Error: Cannot connect to Ollama")
-        print("Please make sure Ollama is running: ollama run llama3.2:3b")
+        print("Please make sure GEMINI_API_KEY is set in your .env file")
     
     print("🚀 Starting Live News AI Web App...")
     app.run(debug=True, host='0.0.0.0', port=5000)

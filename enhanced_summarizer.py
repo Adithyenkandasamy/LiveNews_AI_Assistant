@@ -8,10 +8,13 @@ from transformers import pipeline
 import logging
 
 class EnhancedSummarizer:
-    def __init__(self, model_type="ollama", model_name="llama3.2:3b"):
+    def __init__(self, model_type="gemini", model_config=None):
         self.model_type = model_type
-        self.model_name = model_name
-        self.ollama_url = "http://localhost:11434/api/generate"
+        if model_type == "gemini":
+            self.gemini_client = model_config
+        else:
+            self.model_name = model_config
+        self.ollama_url = "http://localhost:11434/api/generate"  # Keep for backward compatibility
         
         # Initialize based on type
         if model_type == "transformers":
@@ -20,17 +23,42 @@ class EnhancedSummarizer:
     def summarize_article(self, content: str, max_length: int = 150) -> str:
         """Summarize article content using selected model"""
         
-        if self.model_type == "ollama":
-            return self._ollama_summarize(content, max_length)
+        if self.model_type == "gemini":
+            return self._summarize_with_gemini(content, max_length)
+        elif self.model_type == "ollama":
+            return self._summarize_with_ollama(content, max_length)
         elif self.model_type == "transformers":
             return self._transformers_summarize(content, max_length)
         
-    def _ollama_summarize(self, content: str, max_length: int) -> str:
-        """Use Ollama models for summarization"""
+    def _summarize_with_gemini(self, text, max_length=150):
+        """Summarize using Gemini API"""
+        if not self.gemini_client or not self.gemini_client.available:
+            return "Gemini API not available for summarization."
+            
+        prompt = f"""Please provide a concise summary of the following news article in {max_length} words or less:
+
+{text}
+
+Summary:"""
+        
+        try:
+            summary = self.gemini_client.generate_response(
+                prompt,
+                max_tokens=max_length + 50,  # Allow some buffer
+                temperature=0.3
+            )
+            return summary.strip() if summary else "Unable to generate summary."
+        except Exception as e:
+            logging.error(f"Gemini summarization failed: {e}")
+            return f"Summarization error: {str(e)}"
+    
+    def _summarize_with_ollama(self, text, max_length=150):
+        """Summarize article content using selected model"""
+        
         prompt = f"""Summarize this news article in {max_length} words or less. Focus on key facts and main points:
 
 Article:
-{content}
+{text}
 
 Summary:"""
         
@@ -76,8 +104,8 @@ Summary:"""
         """Process full article content intelligently"""
         
         # Use more content based on model capabilities
-        if self.model_type == "ollama" and "llama3.2" in self.model_name:
-            max_input = 2000  # 32K context window
+        if self.model_type == "gemini":
+            max_input = 2000  # Gemini has large context window
         elif self.model_type == "ollama":
             max_input = 1500  # Standard models
         else:
@@ -99,9 +127,13 @@ Summary:"""
 # Example usage
 if __name__ == "__main__":
     # Test with different models
+    # Import gemini client for testing
+    from gemini_client import GeminiClient
+    gemini_client = GeminiClient()
+    
     models_to_test = [
+        ("gemini", gemini_client),
         ("ollama", "llama3.2:3b"),
-        ("ollama", "mistral:7b"),
         ("transformers", "facebook/bart-large-cnn")
     ]
     
@@ -113,9 +145,12 @@ if __name__ == "__main__":
     scientific research and software development.
     """
     
-    for model_type, model_name in models_to_test:
-        print(f"\n--- Testing {model_type}: {model_name} ---")
-        summarizer = EnhancedSummarizer(model_type, model_name)
+    for model_type, model_config in models_to_test:
+        print(f"\n=== Testing {model_type} ===")
+        if model_type == "gemini":
+            summarizer = EnhancedSummarizer(model_type, model_config)
+        else:
+            summarizer = EnhancedSummarizer(model_type, model_config)
         result = summarizer.process_full_article(sample_article)
         print(f"Summary: {result['summary']}")
         print(f"Processed: {result['char_count']} chars, {result['word_count']} words")
