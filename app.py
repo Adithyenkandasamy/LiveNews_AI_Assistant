@@ -399,27 +399,25 @@ class LiveNewsAI:
 
     def _make_canonical_id(self, article: Dict[str, Any]) -> str:
         """Create a stable hash for an article to deduplicate across runs.
-        Uses normalized title + source + normalized URL path. Returns empty string if cannot compute.
+        Uses normalized title only as primary key - same story from different sources should be considered duplicates.
         """
         try:
             title = (article.get('title') or '').strip().lower()
-            source = (article.get('source') or '').strip().lower()
-            url = (article.get('url') or '').strip()
-
-            # Normalize URL to domain + path (ignore query params which often change)
-            if url:
-                p = urlparse(url)
-                norm_url = (p.netloc + p.path).lower()
-            else:
-                norm_url = ''
-
-            # If title is very short, include a bit of content to stabilize hash
-            content = (article.get('content') or '').strip().lower()
-            content_snippet = content[:120]
-
-            key = '\n'.join([title, source, norm_url, content_snippet])
-            return hashlib.sha256(key.encode('utf-8')).hexdigest()
-        except Exception:
+            
+            if not title or len(title) < 10:
+                return ''
+            
+            # Clean and normalize title for better deduplication
+            # Remove common prefixes, quotes, and normalize whitespace
+            title = re.sub(r'^["\']*', '', title)  # Remove leading quotes
+            title = re.sub(r'["\']*$', '', title)  # Remove trailing quotes
+            title = re.sub(r'\s+', ' ', title)    # Normalize whitespace
+            title = title.strip()
+            
+            # Use only title for canonical ID so same story from different sources is detected
+            return hashlib.sha256(title.encode('utf-8')).hexdigest()
+        except Exception as e:
+            self.logger.error(f"Error generating canonical ID: {e}")
             return ''
 
     def clear_old_articles(self):
@@ -438,6 +436,24 @@ class LiveNewsAI:
                 (cutoff_date,)
             )
             
+            old_articles_deleted = cursor.rowcount
+            
+            # Remove duplicate articles (keep the most recent one for each canonical_id)
+            cursor.execute(
+                """
+                DELETE FROM news_articles 
+                WHERE id NOT IN (
+                    SELECT DISTINCT ON (canonical_id) id
+                    FROM news_articles 
+                    WHERE canonical_id IS NOT NULL
+                    ORDER BY canonical_id, collected_date DESC
+                )
+                AND canonical_id IS NOT NULL
+                """
+            )
+            
+            duplicates_deleted = cursor.rowcount
+            
             # Also delete from pathway_articles if it exists
             try:
                 cursor.execute(
@@ -450,13 +466,12 @@ class LiveNewsAI:
             except:
                 pass  # Table might not exist
             
-            deleted_count = cursor.rowcount
             conn.commit()
             cursor.close()
             conn.close()
             
-            self.logger.info(f"🗑️ Cleared {deleted_count} old articles from database")
-            return deleted_count
+            self.logger.info(f"🗑️ Cleared {old_articles_deleted} old articles and {duplicates_deleted} duplicates from database")
+            return old_articles_deleted + duplicates_deleted
             
         except Exception as e:
             self.logger.error(f"Failed to clear old articles: {e}")
