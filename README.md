@@ -15,7 +15,7 @@ LiveNews AI Assistant is an intelligent news chatbot that provides real-time new
 - 🌑 **Modern UI** - Dark theme with glassmorphism effects and smooth animations
 - ⚡ **Duplicate Prevention** - Smart canonical ID system prevents duplicate news
 - 📱 **Responsive Design** - Works seamlessly on desktop and mobile
-- 🔗 **Clickable Links** - Direct access to full original articles
+- 📅 **Article Timestamps** - Clear publication dates and freshness indicators
 
 ## 🚀 Quick Start with UV (Recommended)
 
@@ -72,9 +72,6 @@ DB_USER=your_db_user
 DB_PASSWORD=your_db_password
 DB_PORT=5432
 
-# Ollama (Optional fallback)
-OLLAMA_API_URL=http://localhost:11434
-OLLAMA_MODEL=nemotron-mini
 ```
 
 ### 4. Database Setup
@@ -147,7 +144,7 @@ embeddings = model.encode(["News article text"])
 from transformers import pipeline
 
 summarizer = pipeline("summarization", 
-                     model="facebook/bart-large-cnn")
+                     model="google/pegasus-xsum")
 summary = summarizer(text, max_length=130)
 ```
 
@@ -210,29 +207,225 @@ response = requests.get(
 
 ```
 LiveNews AI Assistant
-├── app.py                 # Main Flask application
+├── app.py                 # Main Flask application & news aggregator
 ├── src/                   # Core modules package
 │   ├── __init__.py       # Package initialization
-│   ├── gemini_client.py  # Google Gemini AI client
-│   ├── summarizer.py     # Enhanced summarization
-│   ├── rag_system.py     # Pathway RAG system
-│   ├── freshness_validator.py # News freshness validation
+│   ├── gemini_client.py  # Google Gemini AI client wrapper
+│   ├── summarizer.py     # Enhanced multi-model summarization
+│   ├── rag_system.py     # Pathway RAG system with vector search
+│   ├── freshness_validator.py # News freshness validation & filtering
 │   └── comparison_tool.py # News comparison utilities
 ├── templates/
-│   └── index.html        # Dark theme UI with glassmorphism
-├── pyproject.toml        # UV/pip dependencies
-├── uv.lock              # Locked dependency versions
+│   └── index.html        # Modern dark theme UI with glassmorphism
+├── pyproject.toml        # UV/pip dependencies configuration
+├── uv.lock              # Locked dependency versions for reproducibility
 ├── .env.example         # Environment variables template
-└── README.md            # This documentation
+└── README.md            # This comprehensive documentation
 ```
 
-### Data Flow
+## 📋 Detailed Code Structure
 
-1. News Ingestion: RSS feeds → Feedparser → PostgreSQL
-2. Duplicate Detection: Canonical ID hashing prevents duplicates  
-3. RAG Processing: Pathway → Sentence Transformers → Vector similarity
-4. AI Response: User query → RAG context → Gemini API → Response
-5. UI Rendering: Flask → Jinja2 templates → Modern dark UI
+### 🚀 **app.py** - Main Application Hub
+The heart of the application containing:
+
+#### **NewsAggregator Class**
+```python
+class NewsAggregator:
+    def __init__(self):
+        # Database connection with PostgreSQL
+        self.db_config = {...}
+        # AI clients initialization
+        self.gemini_client = GeminiClient()
+        self.rag_system = PathwayRAGSystem()
+        # News sources configuration
+        self.RSS_FEEDS = {
+            'BBC': 'https://feeds.bbci.co.uk/news/rss.xml',
+            'CNN': 'http://rss.cnn.com/rss/edition.rss',
+            # ... more sources
+        }
+```
+
+#### **Key Methods:**
+- `fetch_and_store_news()` - Aggregates from 8+ RSS sources including Reddit WorldNews
+- `generate_canonical_id()` - Creates SHA256 hashes to prevent duplicate articles
+- `clear_old_articles()` - Database cleanup removing articles older than 7 days
+- `get_chat_response()` - RAG-powered conversational AI using Gemini
+
+#### **Flask Routes:**
+- `GET /` - Serves the main chat interface
+- `POST /chat` - Handles user queries with RAG context
+- `GET /news` - Returns latest news articles in JSON
+- `GET /health` - Application health check endpoint
+
+### 🤖 **src/gemini_client.py** - AI Client Wrapper
+Handles Google Gemini 2.0 Flash API integration:
+
+```python
+class GeminiClient:
+    def __init__(self):
+        self.api_key = os.getenv('GEMINI_API_KEY')
+        self.model_name = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')
+        self.available = self._test_connection()
+    
+    def generate_response(self, prompt, max_tokens=1000):
+        # Handles API calls with timeout and error handling
+        # Includes safety settings and generation config
+```
+
+**Features:**
+- Automatic fallback handling for API failures
+- Configurable safety settings and generation parameters
+- Connection testing and availability checking
+- Timeout management (30s) to prevent hanging requests
+
+### 🔍 **src/rag_system.py** - Advanced RAG Implementation  
+Sophisticated Retrieval Augmented Generation system:
+
+```python
+class PathwayRAGSystem:
+    def __init__(self, config: PathwayRAGConfig):
+        # Pathway connector for real-time data processing
+        self.pathway_available = self._check_pathway()
+        # SentenceTransformer for embeddings
+        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        # LangChain + Chroma as fallback
+        self.fallback_vectorstore = Chroma()
+```
+
+**Dual-Mode Architecture:**
+- **Primary**: Pathway library for real-time vector operations
+- **Fallback**: LangChain + Chroma for compatibility
+- **Vector Store**: PostgreSQL with pgvector extension support
+- **Embeddings**: 384-dimensional vectors using MiniLM model
+
+### 📰 **src/summarizer.py** - Multi-Model Summarization
+Flexible summarization with multiple AI backends:
+
+```python
+class EnhancedSummarizer:
+    def __init__(self, model_type="gemini"):
+        if model_type == "gemini":
+            self.gemini_client = GeminiClient()
+        elif model_type == "transformers":
+            self.summarizer = pipeline("summarization", 
+                                     model="google/pegasus-xsum")
+```
+
+**Supported Models:**
+- **Gemini 2.0 Flash** - Primary, high-quality summaries
+- **PEGASUS-XSUM** - Transformers fallback for offline use
+- **Content Validation** - Filters low-quality or promotional content
+
+### ✅ **src/freshness_validator.py** - News Quality Control
+Ensures only fresh, relevant news reaches users:
+
+```python
+class FreshnessValidator:
+    def validate_article(self, article):
+        # Time-based filtering (7 days maximum)
+        # Content pattern detection for old news
+        # Publication date validation
+        # Source credibility checking
+```
+
+**Smart Filtering:**
+- **Time Window**: 7 days maximum article age
+- **Pattern Detection**: Blocks articles mentioning "2023", "2022", "last year"
+- **Content Analysis**: AI-powered relevance scoring
+- **Source Validation**: Credible news source verification
+
+### 🔧 **src/comparison_tool.py** - News Analysis Utilities
+Advanced news comparison and analysis:
+
+```python
+class NewsComparisonTool:
+    def compare_articles(self, articles):
+        # Similarity detection using embeddings
+        # Topic clustering and categorization
+        # Duplicate content identification
+        # Source bias analysis
+```
+
+## 🔄 Advanced Data Flow & Processing
+
+### **1. Multi-Source News Ingestion Pipeline**
+```python
+# RSS Sources + Reddit JSON API
+sources = ['BBC', 'CNN', 'Reuters', 'AP', 'NPR', 'Indian Express', 'TOI', 'Reddit WorldNews']
+→ feedparser.parse() / requests.get()
+→ Content validation & sanitization
+→ Publication date parsing & validation
+→ Age filtering (7 days maximum)
+→ Content pattern detection (blocks old news references)
+```
+
+### **2. Intelligent Duplicate Detection**
+```python
+def generate_canonical_id(article):
+    # SHA256 hash of normalized content
+    key = '\n'.join([
+        normalize_title(article['title']),
+        article['source'],
+        normalize_url(article['url']),
+        article['content'][:120]  # Content snippet
+    ])
+    return hashlib.sha256(key.encode()).hexdigest()
+```
+
+### **3. RAG Processing Architecture**
+```
+User Query → Embedding Generation (MiniLM-L6-v2)
+           ↓
+Vector Search (Pathway/PostgreSQL with pgvector)
+           ↓
+Similarity Ranking (Cosine similarity > 0.7)
+           ↓
+Context Assembly (Top 10 relevant articles)
+           ↓
+Gemini API (Contextual response generation)
+```
+
+### **4. Real-time Database Operations**
+- **Automatic Cleanup**: Removes articles older than 7 days on startup
+- **Concurrent Processing**: Multi-threaded news collection
+- **Fallback Systems**: LangChain + Chroma when Pathway unavailable
+- **Connection Pooling**: Efficient PostgreSQL connection management
+
+### **5. AI Response Generation**
+```python
+# Context-aware prompt construction
+prompt = f"""
+Based on these recent news articles:
+{formatted_context}
+
+User question: {user_query}
+Provide accurate, current information...
+"""
+response = gemini_client.generate_response(prompt, max_tokens=1000)
+```
+
+## 🚀 Recent Technical Improvements
+
+### **Migration from Ollama to Gemini (2024)**
+- **Previous**: Local Ollama llama3.2:3b model with timeout issues
+- **Current**: Google Gemini 2.0 Flash API for superior performance
+- **Benefits**: 
+  - Eliminated local model timeout problems
+  - Improved response quality and speed
+  - Better multilingual support
+  - More reliable availability
+
+### **Advanced RAG Implementation**
+- **Pathway Integration**: Real-time vector operations for news processing
+- **Dual-Mode System**: Pathway primary + LangChain fallback
+- **PostgreSQL Vector Storage**: pgvector extension for database-side similarity
+- **Smart Fallbacks**: Automatic Python cosine similarity when pgvector unavailable
+
+### **Enhanced News Quality Control**
+- **Freshness Filtering**: 7-day window with content pattern detection
+- **Source Diversification**: Added Reddit WorldNews JSON API
+- **Content Validation**: AI-powered relevance and quality scoring
+- **Duplicate Prevention**: Sophisticated canonical ID system
 
 ## 🔧 Configuration
 

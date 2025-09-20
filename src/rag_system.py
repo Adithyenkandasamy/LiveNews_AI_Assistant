@@ -1,6 +1,6 @@
 """
 Enhanced RAG System using Pathway library with LangChain fallback
-Integrates with Ollama Nemotron-mini for news analysis and Q&A
+Integrates with Google Gemini AI for advanced news analysis and Q&A
 """
 
 import pathway as pw
@@ -53,7 +53,6 @@ class PathwayRAGSystem:
         # Default backend flags to avoid attribute errors
         self.pathway_available: bool = False
         self.langchain_available: bool = False
-        self.ollama_available: bool = False
 
         self.setup_logging()
         self.setup_database()
@@ -416,11 +415,14 @@ class PathwayRAGSystem:
         """Search for similar articles using RAG with freshness filtering"""
         limit = limit or self.config.max_results
         
+        # Check if user is asking for specific news source
+        source_filter = self._extract_source_filter(query)
+        
         # Get raw results
         if getattr(self, "pathway_available", False):
-            raw_results = self._search_with_pathway(query, limit * 2)  # Get more to filter
+            raw_results = self._search_with_pathway(query, limit * 2, source_filter)  # Get more to filter
         elif getattr(self, "langchain_available", False):
-            raw_results = self._search_with_langchain(query, limit * 2)
+            raw_results = self._search_with_langchain(query, limit * 2, source_filter)
         else:
             self.logger.error("No RAG backend available for search")
             return []
@@ -431,7 +433,33 @@ class PathwayRAGSystem:
         # Return top results after filtering
         return fresh_results[:limit]
             
-    def _search_with_pathway(self, query: str, limit: int) -> List[Dict[str, Any]]:
+    def _extract_source_filter(self, query: str) -> str | None:
+        """Extract specific news source from user query"""
+        query_lower = query.lower()
+        
+        # Map of source variations to actual source names
+        source_mappings = {
+            'indian express': 'Indian Express',
+            'express': 'Indian Express',
+            'bbc': 'BBC',
+            'cnn': 'CNN',
+            'reuters': 'Reuters',
+            'hindu': 'The Hindu',
+            'ndtv': 'NDTV',
+            'times of india': 'Times of India',
+            'techcrunch': 'TechCrunch',
+            'al jazeera': 'Al Jazeera',
+            'reddit': 'Reddit WorldNews',
+            'tech crunch': 'TechCrunch'
+        }
+        
+        for pattern, source in source_mappings.items():
+            if pattern in query_lower:
+                return source
+                
+        return None
+
+    def _search_with_pathway(self, query: str, limit: int, source_filter: str = None) -> List[Dict[str, Any]]:
         """Search using Pathway (with database backend for now)"""
         try:
             # Generate query embedding
@@ -445,17 +473,28 @@ class PathwayRAGSystem:
                 try:
                     conn = psycopg2.connect(**self.db_config)
                     cursor = conn.cursor(cursor_factory=RealDictCursor)
-                    cursor.execute(
+                    
+                    # Build query with optional source filter
+                    if source_filter:
+                        sql = """
+                        SELECT title, content, source, date, category,
+                               (1 - (embedding_vec <=> %s::vector)) as similarity
+                        FROM pathway_articles
+                        WHERE embedding_vec IS NOT NULL AND source ILIKE %s
+                        ORDER BY similarity DESC
+                        LIMIT %s
                         """
+                        cursor.execute(sql, (query_embedding, f"%{source_filter}%", limit))
+                    else:
+                        sql = """
                         SELECT title, content, source, date, category,
                                (1 - (embedding_vec <=> %s::vector)) as similarity
                         FROM pathway_articles
                         WHERE embedding_vec IS NOT NULL
                         ORDER BY similarity DESC
                         LIMIT %s
-                        """,
-                        (query_embedding, limit)
-                    )
+                        """
+                        cursor.execute(sql, (query_embedding, limit))
                     results = cursor.fetchall()
                     cursor.close()
                     conn.close()
@@ -463,30 +502,42 @@ class PathwayRAGSystem:
                 except Exception as sql_err:
                     # If anything goes wrong, gracefully fall back to Python similarity
                     self.logger.warning(f"DB-side similarity not available, falling back to Python. Error: {sql_err}")
-                    return self._search_with_python_similarity(query_embedding, limit)
+                    return self._search_with_python_similarity(query_embedding, limit, source_filter)
             else:
                 # No pgvector support; use Python similarity
-                return self._search_with_python_similarity(query_embedding, limit)
+                return self._search_with_python_similarity(query_embedding, limit, source_filter)
             
         except Exception as e:
             self.logger.error(f"Pathway search failed: {e}")
             return []
 
-    def _search_with_python_similarity(self, query_embedding: List[float], limit: int) -> List[Dict[str, Any]]:
+    def _search_with_python_similarity(self, query_embedding: List[float], limit: int, source_filter: str = None) -> List[Dict[str, Any]]:
         """Fallback similarity search using Python cosine similarity on embeddings stored as FLOAT[]."""
         try:
             conn = psycopg2.connect(**self.db_config)
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             # Fetch a reasonable window of recent rows to keep it fast
-            cursor.execute(
-                """
-                SELECT title, content, source, date, category, embedding
-                FROM pathway_articles
-                WHERE embedding IS NOT NULL
-                ORDER BY id DESC
-                LIMIT 1000
-                """
-            )
+            if source_filter:
+                cursor.execute(
+                    """
+                    SELECT title, content, source, date, category, embedding
+                    FROM pathway_articles
+                    WHERE embedding IS NOT NULL AND source ILIKE %s
+                    ORDER BY id DESC
+                    LIMIT 1000
+                    """,
+                    (f"%{source_filter}%",)
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT title, content, source, date, category, embedding
+                    FROM pathway_articles
+                    WHERE embedding IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 1000
+                    """
+                )
             rows = cursor.fetchall()
             cursor.close()
             conn.close()
@@ -527,7 +578,7 @@ class PathwayRAGSystem:
             self.logger.error(f"Python similarity fallback failed: {e}")
             return []
             
-    def _search_with_langchain(self, query: str, limit: int) -> List[Dict[str, Any]]:
+    def _search_with_langchain(self, query: str, limit: int, source_filter: str = None) -> List[Dict[str, Any]]:
         """Search using LangChain vector store"""
         try:
             # Similarity search
@@ -535,10 +586,15 @@ class PathwayRAGSystem:
             
             results = []
             for doc in docs:
+                # Apply source filter if specified
+                doc_source = doc.metadata.get('source', '')
+                if source_filter and source_filter.lower() not in doc_source.lower():
+                    continue
+                    
                 results.append({
                     'content': doc.page_content,
                     'title': doc.metadata.get('title', ''),
-                    'source': doc.metadata.get('source', ''),
+                    'source': doc_source,
                     'date': doc.metadata.get('date', ''),
                     'category': doc.metadata.get('category', 'General'),
                     'similarity': 0.8  # LangChain doesn't return similarity scores directly

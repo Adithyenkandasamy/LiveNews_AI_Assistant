@@ -1,6 +1,6 @@
 """
 Google Gemini API Client for LiveNews AI Assistant
-Replaces Ollama integration with Google's Gemini API
+Advanced AI client using Google's Gemini 2.0 Flash model
 """
 
 import google.generativeai as genai

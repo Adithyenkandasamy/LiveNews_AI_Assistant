@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Live News AI Flask Web Application
-Real-time news chatbot using Ollama Nemotron-mini
+Real-time news chatbot using Google Gemini AI
 """
 
 from flask import Flask, render_template, request, jsonify
@@ -35,9 +35,6 @@ class LiveNewsAI:
         self.gemini_client = GeminiClient(os.getenv('APP_GEMINI_MODEL', 'gemini-2.0-flash'))
         self.model_available = self.gemini_client.available
         
-        # Keep ollama config for backward compatibility (will be removed)
-        self.ollama_url = "http://localhost:11434/api/generate"
-        self.ollama_model = "llama3.2:3b"
         
         # News sources  
         self.news_feeds = {
@@ -50,8 +47,9 @@ class LiveNewsAI:
             'The Hindu': 'https://www.thehindu.com/news/national/feeder/default.rss',
             'Indian Express': 'https://indianexpress.com/section/india/feed/',
             'NDTV India': 'https://feeds.feedburner.com/ndtvnews-india-news',
-            'Times of India': 'https://timesofindia.indiatimes.com/india/rss.cms',
+            'Times of India': 'https://timesofindia.indiatimes.com/rssfeedstopstories.cms',
             'Al Jazeera India': 'https://www.aljazeera.com/xml/rss/all.xml',  # Will filter by query
+            'Reddit WorldNews': 'https://www.reddit.com/r/worldnews.json',
             'TechCrunch': 'https://techcrunch.com/feed/',
             'Google News Tech': 'https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx1YlY4U0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en',
             'Hacker News': 'https://hnrss.org/frontpage'
@@ -193,6 +191,10 @@ class LiveNewsAI:
         """Start background news collection"""
         if not self.collection_running:
             self.collection_running = True
+            
+            # Clear old articles from database first
+            cleared_count = self.clear_old_articles()
+            
             collection_thread = threading.Thread(target=self._news_collection_worker, daemon=True)
             collection_thread.start()
             self.logger.info("🔄 Started background news collection")
@@ -223,6 +225,14 @@ class LiveNewsAI:
         for source_name, feed_url in self.news_feeds.items():
             try:
                 self.logger.info(f"Fetching from {source_name}...")
+                
+                # Handle Reddit JSON API differently
+                if 'reddit.com' in feed_url and feed_url.endswith('.json'):
+                    articles_from_source = self._fetch_reddit_articles(source_name, feed_url)
+                    all_articles.extend(articles_from_source)
+                    continue
+                
+                # Handle RSS feeds
                 feed = feedparser.parse(feed_url)
                 self.logger.info(f"Found {len(feed.entries)} entries from {source_name}")
                 
@@ -233,9 +243,30 @@ class LiveNewsAI:
                             pub_date = datetime(*entry.published_parsed[:6])
                         else:
                             pub_date = datetime.now()
-                            
-                        # Get full content without artificial limits
+                        
+                        # Get full content without artificial limits first
                         full_content = entry.get('summary', '') or entry.get('description', '') or entry.get('content', '')
+                        
+                        # Skip articles older than 7 days to prevent old news
+                        age_hours = (datetime.now() - pub_date).total_seconds() / 3600
+                        if age_hours > 168:  # 7 days in hours
+                            continue
+                        
+                        # Additional check for old news content patterns
+                        title_and_content = (entry.get('title', '') + ' ' + str(full_content)).lower()
+                        old_indicators = [
+                            '2023', '2022', '2021', 'last year', 'years ago', 
+                            'months ago', 'following a 2023', 'since 2023',
+                            'last month', 'previous year'
+                        ]
+                        if any(indicator in title_and_content for indicator in old_indicators):
+                            continue
+                        
+                        # Handle content that might be a list (fix Indian Express parsing errors)
+                        if isinstance(full_content, list):
+                            full_content = ' '.join(str(item) for item in full_content if item)
+                        elif not isinstance(full_content, str):
+                            full_content = str(full_content) if full_content else ''
                         
                         # Validate content exists and is meaningful
                         if not full_content or len(full_content.strip()) < 20:
@@ -267,6 +298,49 @@ class LiveNewsAI:
         self.logger.info(f"Total articles collected and stored: {len(all_articles)}")
         return all_articles
         
+    def _fetch_reddit_articles(self, source_name: str, json_url: str) -> List[Dict[str, Any]]:
+        """Fetch articles from Reddit JSON API"""
+        try:
+            headers = {'User-Agent': 'LiveNews-AI-Bot/1.0'}
+            response = requests.get(json_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            articles = []
+            
+            for post in data['data']['children'][:5]:  # Top 5 posts
+                post_data = post['data']
+                
+                # Skip if it's a deleted/removed post
+                if post_data.get('removed_by_category') or not post_data.get('title'):
+                    continue
+                
+                # Get post content - use selftext for text posts, or url for link posts
+                content = post_data.get('selftext', '') or post_data.get('url', '')
+                if not content or len(content.strip()) < 20:
+                    continue
+                
+                # Convert Reddit timestamp to datetime
+                created_utc = post_data.get('created_utc', 0)
+                pub_date = datetime.fromtimestamp(created_utc) if created_utc else datetime.now()
+                
+                article = {
+                    'title': post_data.get('title', ''),
+                    'content': content,
+                    'source': 'Reddit WorldNews',  # Use consistent source name
+                    'date': pub_date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'url': f"https://reddit.com{post_data.get('permalink', '')}",
+                    'category': 'World News'
+                }
+                articles.append(article)
+                
+            self.logger.info(f"Fetched {len(articles)} articles from Reddit WorldNews")
+            return articles
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching Reddit articles: {e}")
+            return []
+            
     def _categorize_article(self, text: str) -> str:
         """Categorize article based on content"""
         categories = {
@@ -348,6 +422,46 @@ class LiveNewsAI:
         except Exception:
             return ''
 
+    def clear_old_articles(self):
+        """Clear old articles from database to refresh storage"""
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            # Delete articles older than 7 days
+            cutoff_date = datetime.now() - timedelta(days=7)
+            cursor.execute(
+                """
+                DELETE FROM news_articles 
+                WHERE collected_date < %s
+                """,
+                (cutoff_date,)
+            )
+            
+            # Also delete from pathway_articles if it exists
+            try:
+                cursor.execute(
+                    """
+                    DELETE FROM pathway_articles 
+                    WHERE date < %s
+                    """,
+                    (cutoff_date.strftime('%Y-%m-%d %H:%M:%S'),)
+                )
+            except:
+                pass  # Table might not exist
+            
+            deleted_count = cursor.rowcount
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            self.logger.info(f"🗑️ Cleared {deleted_count} old articles from database")
+            return deleted_count
+            
+        except Exception as e:
+            self.logger.error(f"Failed to clear old articles: {e}")
+            return 0
+
     def _backfill_canonical_ids(self, batch_size: int = 1000):
         """Populate canonical_id for rows where it is NULL, in batches."""
         processed = 0
@@ -393,6 +507,23 @@ class LiveNewsAI:
         for source_name, feed_url in self.news_feeds.items():
             try:
                 self.logger.info(f"Fetching from {source_name}...")
+                
+                # Handle Reddit JSON API differently
+                if 'reddit.com' in feed_url and feed_url.endswith('.json'):
+                    articles_from_source = self._fetch_reddit_articles(source_name, feed_url)
+                    for article in articles_from_source:
+                        # Check freshness for Reddit articles too
+                        try:
+                            article_date = datetime.strptime(article['date'], '%Y-%m-%d %H:%M:%S')
+                            age_hours = (datetime.now() - article_date).total_seconds() / 3600
+                            if age_hours > 168:  # 7 days in hours
+                                continue
+                        except:
+                            pass
+                        all_news.append(article)
+                    continue
+                
+                # Handle RSS feeds
                 feed = feedparser.parse(feed_url)
                 
                 for entry in feed.entries[:5]:  # Top 5 from each source
@@ -408,9 +539,29 @@ class LiveNewsAI:
                     except:
                         pub_date = datetime.now() - timedelta(hours=1)
                     
-                    # Be more lenient with time filtering for now
-                    # Get full content without limits
+                    # Get full content without limits first
                     full_content = entry.get('summary', '') or entry.get('description', '') or entry.get('content', '')
+                    
+                    # Handle content that might be a list (fix Indian Express parsing errors)
+                    if isinstance(full_content, list):
+                        full_content = ' '.join(str(item) for item in full_content if item)
+                    elif not isinstance(full_content, str):
+                        full_content = str(full_content) if full_content else ''
+                    
+                    # Skip articles older than 7 days to prevent old news
+                    age_hours = (datetime.now() - pub_date).total_seconds() / 3600
+                    if age_hours > 168:  # 7 days in hours
+                        continue
+                    
+                    # Additional check for old news content patterns
+                    title_and_content = (entry.get('title', '') + ' ' + str(full_content)).lower()
+                    old_indicators = [
+                        '2023', '2022', '2021', 'last year', 'years ago', 
+                        'months ago', 'following a 2023', 'since 2023',
+                        'last month', 'previous year', 'adani group'
+                    ]
+                    if any(indicator in title_and_content for indicator in old_indicators):
+                        continue
                     
                     # Skip if no meaningful content
                     if not full_content or len(full_content.strip()) < 20:
@@ -507,7 +658,7 @@ class LiveNewsAI:
                                 f"No hot news recently on {topic}."
                             )
                         if not has_any and topic:  # Only return "no news" if specific topic was requested
-                            return f"No hot news recently on {topic}."
+                            return f"I don't have recent news about {topic} at the moment, but I'll keep looking for updates and provide them later when available."
 
                     rag_result = self.pathway_rag.query(user_input)
                     
@@ -552,10 +703,7 @@ class LiveNewsAI:
                                 date_display = date_info
                                 
                             news_context += f"{i}. {title}\n"
-                            news_context += f"   Source: {source.get('source', 'Unknown')} | {date_display}\n"
-                            # Add clickable link if available
-                            if source.get('url'):
-                                news_context += f"   Link: {source.get('url')}\n"
+                            news_context += f"   Published: {date_display}\n"
                             news_context += f"   Content: {content}\n\n"  # Full content, no truncation
                         
                         # Add freshness info if available
@@ -569,32 +717,28 @@ class LiveNewsAI:
                             bullets = []
                             for src in sorted_sources[:3]:
                                 title = src.get('title', 'No title')
-                                source = src.get('source', '?')
                                 date = src.get('date', '?')
-                                link = src.get('url', '')
-                                bullet = f"- {title} — {source} ({date})"
-                                if link:
-                                    bullet += f"\n  Read more: {link}"
+                                bullet = f"- {title} ({date})"
                                 bullets.append(bullet)
                             return "Here are the latest updates:\n" + "\n".join(bullets)
                         
-                        # Enhanced prompt with link instructions
+                        # Enhanced prompt for news responses
                         if wants_full_text:
-                            prompt = f"""You are a news AI assistant. Provide detailed information using the news below. Include relevant links for users to read the full articles.
+                            prompt = f"""You are a news AI assistant. Provide detailed information using the news below. Focus on the key facts and context from the articles. DO NOT mention specific news sources or where the information came from.
 
 {news_context}
 
 User: {user_input}
 
-Provide a comprehensive response with details and encourage users to click the links for full articles."""
+Provide a comprehensive response with details from the available news information without revealing sources."""
                         else:
-                            prompt = f"""You are a news AI assistant. Answer concisely using the news below. Always mention that links are available for full articles.
+                            prompt = f"""You are a news AI assistant. Answer concisely using the news below. Focus on the most important facts. DO NOT mention specific news sources or where the information came from.
 
 {news_context}
 
 User: {user_input}
 
-Give a brief, direct response (2-3 sentences max) and remind users they can click the links for full articles."""
+Give a brief, direct response (2-3 sentences max) based on the available news information without revealing sources."""
 
                     else:
                         # RAG found no results, fallback to direct news fetch
@@ -619,45 +763,60 @@ Give a brief, direct response (2-3 sentences max) and remind users they can clic
                                     warning = " ⚠️ OLD NEWS"
                                     
                                 news_context += f"{i}. {news['title']}{warning}\n"
-                                news_context += f"   Source: {news['source']} | {date_display}\n"
-                                # Add clickable link if available
-                                if news.get('link'):
-                                    news_context += f"   Link: {news['link']}\n"
+                                news_context += f"   Published: {date_display}\n"
                                 news_context += f"   Content: {summary}\n\n"
                             if wants_summary or not self.model_available:
-                                bullets = []
-                                for n in latest_news[:3]:
-                                    bullet = f"- {n['title']} — {n['source']} ({n['date']})"
-                                    if n.get('link'):
-                                        bullet += f"\n  Read more: {n['link']}"
-                                    bullets.append(bullet)
+                                bullets = [
+                                    f"- {n['title']} ({n['date']})" for n in latest_news[:3]
+                                ]
                                 return "Here are the latest updates:\n" + "\n".join(bullets)
                             
                             if wants_full_text:
-                                prompt = f"""Provide detailed analysis using the news below. Include information about article links for readers who want the complete stories.
+                                prompt = f"""Provide detailed analysis using the news below. Focus on comprehensive coverage of the news content. DO NOT mention specific news sources or where the information came from.
 
 {news_context}
 
 User: {user_input}
 
-Provide comprehensive coverage and mention the article links."""
+Provide comprehensive coverage based on the available news information without revealing sources."""
                             else:
-                                prompt = f"""Answer briefly using news below. Remind users that full article links are provided.
+                                prompt = f"""Answer briefly using news below. Focus on the key facts from the available news sources. DO NOT mention specific news sources or where the information came from.
 
 {news_context}
 
 User: {user_input}
 
-Keep response short (2-3 sentences) but mention the article links."""
+Keep response short (2-3 sentences) based on the news information without revealing sources."""
                         else:
                             # If user asked about a specific topic/location and nothing found, respond clearly
                             if topic:
-                                return f"No hot news recently on {topic}."
-                            prompt = f"""No recent news found. Current time: {current_time}
+                                return f"I don't have recent news about {topic} at the moment, but I'll keep looking for updates and provide them later when available."
+                            
+                            # Try to get any recent news to show instead of generic response
+                            fallback_news = self.fetch_latest_news(24, user_input)
+                            if fallback_news:
+                                news_context = f"Current Date & Time: {current_time}\n\n"
+                                news_context += "Latest Available News:\n"
+                                for i, news in enumerate(fallback_news[:3], 1):
+                                    summary = news.get('summary', news.get('content', ''))[:200] + "..."
+                                    date_display = news.get('date', 'Unknown date')
+                                    news_context += f"{i}. {news['title']}\n"
+                                    news_context += f"   Published: {date_display}\n"
+                                    news_context += f"   Summary: {summary}\n\n"
+                                
+                                prompt = f"""Based on the latest news available, provide a helpful response. DO NOT mention specific news sources.
+
+{news_context}
 
 User: {user_input}
 
-Brief response: I don't have current news. Check BBC, CNN, or Reuters for latest updates."""
+Provide a brief, helpful response based on the available news information without revealing sources."""
+                            else:
+                                prompt = f"""No recent news found. Current time: {current_time}
+
+User: {user_input}
+
+Brief response: I don't have current news updates available at the moment. Please try again in a few minutes as I'm continuously updating my news database."""
                             
                 except Exception as e:
                     self.logger.error(f"RAG query failed: {e}")
@@ -672,7 +831,7 @@ Brief response: I don't have current news. Check BBC, CNN, or Reuters for latest
                             news_context += f"{i}. {news['title']}\n"
                             news_context += f"   Source: {news['source']} | {news['date']}\n"
                             news_context += f"   Summary: {news['summary']}\n\n"
-                        if wants_summary or not ollama_available:
+                        if wants_summary or not self.model_available:
                             bullets = [
                                 f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
                             ]
@@ -753,11 +912,9 @@ Give a brief, direct response (1-2 sentences)."""
             latest_news = self.fetch_latest_news(24, user_input)
             if latest_news:
                 bullets = []
-                for n in latest_news[:3]:
-                    bullet = f"- {n['title']} — {n['source']} ({n['date']})"
-                    if n.get('link'):
-                        bullet += f"\n  Read full article: {n['link']}"
-                    bullets.append(bullet)
+                bullets = [
+                    f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
+                ]
                 return "Here are the latest updates:\n" + "\n".join(bullets)
             # If user asked for a specific topic and nothing found, respond clearly
             if topic:
@@ -983,18 +1140,8 @@ def force_news_collection():
 def health_check():
     """Comprehensive health check endpoint"""
     try:
-        # Test Ollama connection
-        test_response = requests.post(
-            news_ai.ollama_url,
-            json={
-                "model": news_ai.ollama_model,
-                "prompt": "Hello",
-                "stream": False
-            },
-            timeout=5
-        )
-        
-        ollama_status = "connected" if test_response.status_code == 200 else "disconnected"
+        # Test Gemini connection
+        gemini_status = "connected" if news_ai.model_available else "disconnected"
         
         # Test database connection
         try:
@@ -1008,8 +1155,8 @@ def health_check():
             db_status = "disconnected"
         
         return jsonify({
-            'status': 'healthy' if ollama_status == 'connected' and db_status == 'connected' else 'partial',
-            'ollama': ollama_status,
+            'status': 'healthy' if gemini_status == 'connected' and db_status == 'connected' else 'partial',
+            'gemini': gemini_status,
             'database': db_status,
             'rag_system': 'available' if news_ai.rag_available else 'unavailable',
             'freshness_validator': 'available' if news_ai.freshness_validator else 'unavailable',
@@ -1026,25 +1173,11 @@ def health_check():
         }), 500
 
 if __name__ == '__main__':
-    # Check Ollama connection on startup
-    try:
-        test_response = requests.post(
-            news_ai.ollama_url,
-            json={
-                "model": news_ai.ollama_model,
-                "prompt": "Hello",
-                "stream": False
-            },
-            timeout=5
-        )
-        
-        if test_response.status_code == 200:
-            print("✅ Connected to Ollama Llama 3.2:3b")
-        else:
-            print("⚠️ Warning: Ollama connection failed")
-            
-    except Exception as e:
-        print("❌ Error: Cannot connect to Ollama")
+    # Check Gemini connection on startup
+    if news_ai.model_available:
+        print("✅ Connected to Google Gemini AI")
+    else:
+        print("❌ Error: Cannot connect to Gemini API")
         print("Please make sure GEMINI_API_KEY is set in your .env file")
     
     print("🚀 Starting Live News AI Web App...")

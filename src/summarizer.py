@@ -14,19 +14,16 @@ class EnhancedSummarizer:
             self.gemini_client = model_config
         else:
             self.model_name = model_config
-        self.ollama_url = "http://localhost:11434/api/generate"  # Keep for backward compatibility
         
         # Initialize based on type
         if model_type == "transformers":
-            self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+            self.summarizer = pipeline("summarization", model="google/pegasus-xsum")
         
     def summarize_article(self, content: str, max_length: int = 150) -> str:
         """Summarize article content using selected model"""
         
         if self.model_type == "gemini":
             return self._summarize_with_gemini(content, max_length)
-        elif self.model_type == "ollama":
-            return self._summarize_with_ollama(content, max_length)
         elif self.model_type == "transformers":
             return self._transformers_summarize(content, max_length)
         
@@ -60,44 +57,6 @@ Summary:"""
             logging.error(f"Gemini summarization failed: {e}")
             return f"Summarization error: {str(e)}"
     
-    def _summarize_with_ollama(self, text, max_length=150):
-        """Summarize article content using selected model with better validation"""
-        
-        # Check for content availability
-        if not text or len(text.strip()) < 20:
-            return "No meaningful content available to summarize."
-        
-        prompt = f"""Summarize this news article in approximately {max_length} words. Focus on key facts and main points. If the content is insufficient or unclear, please indicate that:
-
-Article:
-{text}
-
-Summary:"""
-        
-        try:
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "num_predict": max_length + 100  # More generous token allowance
-                    }
-                },
-                timeout=60  # Increased timeout for longer content
-            )
-            
-            if response.status_code == 200:
-                result = response.json().get('response', '').strip()
-                return result if result else "No summary could be generated from the content."
-            else:
-                return "Summary service temporarily unavailable"
-                
-        except Exception as e:
-            logging.error(f"Ollama summarization failed: {e}")
-            return "Summary service temporarily unavailable"
     
     def _transformers_summarize(self, content: str, max_length: int) -> str:
         """Use Hugging Face transformers for summarization"""
@@ -133,8 +92,6 @@ Summary:"""
         # Use much larger content windows based on model capabilities
         if self.model_type == "gemini":
             max_input = 8000  # Gemini has very large context window
-        elif self.model_type == "ollama":
-            max_input = 4000  # Modern models can handle more
         else:
             max_input = 2000  # Even transformers can handle more
             
@@ -201,8 +158,7 @@ if __name__ == "__main__":
     
     models_to_test = [
         ("gemini", gemini_client),
-        ("ollama", "llama3.2:3b"),
-        ("transformers", "facebook/bart-large-cnn")
+        ("transformers", "google/pegasus-xsum")
     ]
     
     sample_article = """
