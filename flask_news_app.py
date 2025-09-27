@@ -58,6 +58,7 @@ class EnhancedNewsApp:
             # Gemini AI Client
             self.gemini_client = GeminiClient(os.getenv('GEMINI_MODEL', 'gemini-2.0-flash'))
             self.gemini_available = self.gemini_client.available
+            self.model_available = self.gemini_available  # Add this for compatibility
             self.logger.info(f"✅ Gemini AI: {'Available' if self.gemini_available else 'Not Available'}")
             
             # GNews API
