@@ -643,7 +643,7 @@ class வெளிச்சம்AI:
         user_lower = user_input.lower()
         
         if any(word in user_lower for word in ['hello', 'hi', 'hey']):
-            return f"Hello! I'm your வெளிச்சம் assistant. Ask me about recent news or type 'latest news' to see current headlines."
+            return f"Hello! I'm your FlashFeed AI assistant. Ask me about recent news or type 'latest news' to see current headlines."
             
         if any(word in user_lower for word in ['news', 'latest', 'headlines', 'today']):
             # Return latest cached articles as simple text

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-வெளிச்சம் - Enhanced News Intelligence Platform - Flask Application
+Flash Feed - Enhanced News Intelligence Platform - Flask Application
 Real-time news with GNews API, News API, and Gemini RAG
 """
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
 import requests
 import json
 from datetime import datetime, timedelta
@@ -14,7 +14,7 @@ import os
 from dotenv import load_dotenv
 # Using direct HTTP requests for GNews.io API
 from newsapi import NewsApiClient
-from src.gemini_client import GeminiClient
+# from src.gemini_client import GeminiClient
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import hashlib
@@ -24,6 +24,7 @@ from threading import Lock
 
 load_dotenv()
 app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'velicham-secret-key-2024')
 
 class EnhancedNewsApp:
     """Enhanced News Application with multiple APIs and Gemini RAG"""
@@ -55,11 +56,13 @@ class EnhancedNewsApp:
         
     def setup_apis(self):
         try:
-            # Gemini AI Client
-            self.gemini_client = GeminiClient(os.getenv('GEMINI_MODEL', 'gemini-2.0-flash'))
-            self.gemini_available = self.gemini_client.available
-            self.model_available = self.gemini_available  # Add this for compatibility
-            self.logger.info(f"✅ Gemini AI: {'Available' if self.gemini_available else 'Not Available'}")
+            # Gemini AI Client - Direct integration
+            import google.generativeai as genai
+            genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+            self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            self.gemini_available = True
+            self.model_available = True
+            self.logger.info("✅ Gemini AI: Available")
             
             # GNews API
             self.gnews_api_key = os.getenv('GNEWS_API_KEY')
@@ -298,7 +301,7 @@ CREDIBILITY: [HIGH/MEDIUM/LOW]
 RED_FLAGS: [list any concerning elements]
 REASONING: [brief explanation]"""
 
-            response = self.gemini_client.generate_response(prompt)
+            response = self.gemini_model.generate_content(prompt).text
             
             if response:
                 lines = response.strip().split('\n')
@@ -372,7 +375,7 @@ TAGS: [tag1, tag2, tag3]
 FAKE_SCORE: [0-100]
 CREDIBILITY: [HIGH/MEDIUM/LOW]"""
 
-            response = self.gemini_client.generate_response(prompt)
+            response = self.gemini_model.generate_content(prompt).text
             
             if response:
                 # Parse AI response
@@ -571,7 +574,7 @@ CREDIBILITY: [HIGH/MEDIUM/LOW]"""
             Provide a helpful response based on the available news information.
             """
             
-            response = self.gemini_client.generate_response(prompt)
+            response = self.gemini_model.generate_content(prompt).text
             return response
             
         except Exception as e:
@@ -584,24 +587,25 @@ news_app = EnhancedNewsApp()
 # Flask Routes
 @app.route('/')
 def index():
-    """Main news landing page"""
-    articles = news_app.get_articles_from_db(30)
-    
-    # Get stats
-    total_articles = len(articles)
-    sources = len(set(article['source'] for article in articles))
-    categories = len(set(article['category'] for article in articles))
-    ai_enhanced = len([a for a in articles if a.get('keywords')])
-    
-    stats = {
-        'total_articles': total_articles,
-        'sources_count': sources,
-        'categories_count': categories,
-        'ai_enhanced': ai_enhanced,
-        'last_updated': news_app.last_fetch_time.strftime('%H:%M') if news_app.last_fetch_time else 'Loading...',
-        'quota_status': 'OK' if not news_app.quota_exceeded else 'Limited'
-    }  
-    return render_template('news_index.html', articles=articles, stats=stats)
+    """Main page with news feed"""
+    try:
+        # Get news articles
+        articles = news_app.get_articles_from_db(limit=20)
+        
+        # Calculate stats
+        total_articles = len(articles)
+        ai_enhanced = sum(1 for article in articles if article.get('ai_enhanced'))
+        fake_news_detected = sum(1 for article in articles if article.get('fake_news_score', 0) > 70)
+        sources_count = len(set(article.get('source', 'Unknown') for article in articles))
+        
+        return render_template('main.html', 
+                             articles=articles,
+                             total_articles=total_articles,
+                             ai_enhanced=ai_enhanced,
+                             fake_news_detected=fake_news_detected,
+                             sources_count=sources_count)
+    except Exception as e:
+        return f"Error loading news: {e}", 500
 
 @app.route('/article/<int:article_id>')
 def article_detail(article_id):
@@ -627,22 +631,22 @@ def article_detail(article_id):
     except Exception as e:
         return f"Error loading article: {e}", 500
 
-@app.route('/chat', methods=['POST'])
-def chat():
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
     """Chat endpoint for AI assistant"""
     try:
         data = request.get_json()
-        user_message = data.get('message', '')
+        query = data.get('query', '')
         
-        if not user_message:
-            return jsonify({'error': 'No message provided'}), 400
-            
-        # Get AI response
-        ai_response = news_app.chat_with_news(user_message)
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        # Get response from news app
+        response = news_app.chat_with_news(query)
         
         return jsonify({
-            'response': ai_response,
-            'timestamp': datetime.now().strftime('%H:%M:%S')
+            'response': response,
+            'timestamp': datetime.now().isoformat()
         })
         
     except Exception as e:
@@ -800,7 +804,7 @@ def api_ai_brief():
             })
         
         # Create a simple brief
-        brief_text = f"Here's your வெளிச்சம் news brief:\n\n"
+        brief_text = f"Here's your Flash Feed news brief:\n\n"
         for i, article in enumerate(articles, 1):
             brief_text += f"{i}. {article.get('title', '')}\n"
             brief_text += f"   {article.get('summary', '')[:100]}...\n\n"
@@ -820,6 +824,120 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
+
+# Authentication routes
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        data = request.get_json() if request.is_json else request.form
+        email = data.get('email')
+        password = data.get('password')
+        
+        # Simple demo authentication - replace with real auth
+        if email and password:
+            session['user'] = {
+                'id': '1',
+                'email': email,
+                'name': email.split('@')[0].title(),
+                'location': 'Mumbai, IN'
+            }
+            if request.is_json:
+                return jsonify({'success': True, 'user': session['user']})
+            flash('Login successful!', 'success')
+            return redirect(url_for('index'))
+        
+        if request.is_json:
+            return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
+        flash('Invalid credentials', 'error')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    flash('Logged out successfully', 'info')
+    return redirect(url_for('index'))
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        data = request.get_json() if request.is_json else request.form
+        name = data.get('name')
+        email = data.get('email')
+        password = data.get('password')
+        
+        if name and email and password:
+            session['user'] = {
+                'id': '1',
+                'email': email,
+                'name': name,
+                'location': 'Mumbai, IN'
+            }
+            if request.is_json:
+                return jsonify({'success': True, 'user': session['user']})
+            flash('Account created successfully!', 'success')
+            return redirect(url_for('index'))
+        
+        if request.is_json:
+            return jsonify({'success': False, 'error': 'All fields required'}), 400
+        flash('All fields are required', 'error')
+    
+    return render_template('signup.html')
+
+# Add AI summarization route
+@app.route('/api/summarize/<int:article_id>')
+def summarize_article(article_id):
+    """Generate AI summary for a specific article"""
+    try:
+        # Get article from database
+        conn = psycopg2.connect(
+            host=os.getenv('DB_HOST', 'localhost'),
+            database=os.getenv('DB_NAME', 'news_db'),
+            user=os.getenv('DB_USER', 'postgres'),
+            password=os.getenv('DB_PASSWORD', 'password')
+        )
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cursor.execute("SELECT * FROM articles WHERE id = %s", (article_id,))
+        article = cursor.fetchone()
+        
+        if not article:
+            return jsonify({'error': 'Article not found'}), 404
+        
+        # Generate AI summary if available
+        if news_app.gemini_client and news_app.model_available:
+            content = article.get('content', article.get('description', ''))
+            
+            prompt = f"""Summarize this news article in 2-3 clear, concise sentences. Focus on the key facts and main points.
+
+Title: {article.get('title', '')}
+Content: {content[:1000]}...
+
+Provide a brief, factual summary:"""
+            
+            try:
+                summary = news_app.gemini_client.generate_response(prompt)
+                return jsonify({
+                    'summary': summary,
+                    'article_id': article_id,
+                    'title': article.get('title', '')
+                })
+            except Exception as e:
+                news_app.logger.error(f"AI summarization error: {e}")
+        
+        # Fallback summary
+        content = article.get('content', article.get('description', ''))
+        fallback_summary = content[:200] + "..." if len(content) > 200 else content
+        
+        return jsonify({
+            'summary': fallback_summary,
+            'article_id': article_id,
+            'title': article.get('title', ''),
+            'fallback': True
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

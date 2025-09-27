@@ -1,4 +1,4 @@
-// Enhanced வெளிச்சம் Platform - JavaScript
+// Enhanced Flash Feed Platform - JavaScript
 let chatOpen = false;
 
 function openArticle(articleId) {
