@@ -16,7 +16,7 @@ import time
 from src.rag_system import PathwayRAGSystem, PathwayRAGConfig
 from src.freshness_validator import NewsFreshnessValidator, FreshnessConfig
 from src.comparison_tool import NewsComparisonTool
-from src.gemini_client import GeminiClient
+# from src.gemini_client import GeminiClient  # Removed API dependency
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
@@ -27,13 +27,13 @@ from dotenv import load_dotenv
 load_dotenv()
 app = Flask(__name__)
 
-class LiveNewsAI:
+class வெளிச்சம்AI:
     """Real-time news AI chatbot"""
     
     def __init__(self):
-        # Initialize Gemini client
-        self.gemini_client = GeminiClient(os.getenv('APP_GEMINI_MODEL', 'gemini-2.0-flash'))
-        self.model_available = self.gemini_client.available
+        # No external API dependencies - work offline
+        self.model_available = False
+        self.gemini_client = None
         
         
         # News sources  
@@ -59,48 +59,29 @@ class LiveNewsAI:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         
+        # Store articles in memory for Flask routes
+        self.cached_articles = []
+        self.last_fetch_time = None
+        
         # Database configuration
         self.setup_database()
         
-        # Initialize all systems
-        self.setup_rag_system()
-        self.setup_news_comparison()
+        # Skip RAG system setup - work without external APIs
+        self.rag_available = False
+        self.pathway_rag = None
+        self.freshness_validator = None
+        self.comparison_tool = None
         
         # Start background news collection
         self.collection_running = False
         self.start_news_collection()
         
     def setup_rag_system(self):
-        """Initialize Pathway RAG and news freshness validator"""
-        try:
-            # Setup Pathway RAG
-            pathway_config = PathwayRAGConfig(
-                gemini_client=self.gemini_client,
-                embedding_model='all-MiniLM-L6-v2',
-                chunk_size=512,
-                max_results=5
-            )
-            
-            self.pathway_rag = PathwayRAGSystem(pathway_config)
-            # Mark RAG as available only if a backend is ready
-            self.rag_available = bool(getattr(self.pathway_rag, 'pathway_available', False) or getattr(self.pathway_rag, 'langchain_available', False))
-            self.logger.info("✅ Pathway RAG system initialized")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize Pathway RAG: {e}")
-            self.rag_available = False
-            
-        # Setup freshness validator
-        try:
-            freshness_config = FreshnessConfig(
-                gemini_client=self.gemini_client
-            )
-            self.freshness_validator = NewsFreshnessValidator(freshness_config)
-            self.logger.info("✅ News freshness validator initialized")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize freshness validator: {e}")
-            self.freshness_validator = None
+        """Skip RAG system - work offline without APIs"""
+        self.rag_available = False
+        self.pathway_rag = None
+        self.freshness_validator = None
+        self.logger.info("✅ Working offline - no external APIs required")
             
     def setup_database(self):
         """Setup database configuration"""
@@ -206,9 +187,9 @@ class LiveNewsAI:
                 self.logger.info("📰 Collecting latest news...")
                 articles = self.fetch_and_store_news()
                 
-                if articles and self.rag_available:
-                    # Add to RAG system
-                    self.pathway_rag.add_news_articles(articles)
+                # Cache articles for Flask routes
+                self.cached_articles = articles[:30]  # Keep latest 30 for display
+                self.last_fetch_time = datetime.now()
                     
                 self.logger.info(f"✅ Collected {len(articles)} articles")
                 
@@ -301,7 +282,7 @@ class LiveNewsAI:
     def _fetch_reddit_articles(self, source_name: str, json_url: str) -> List[Dict[str, Any]]:
         """Fetch articles from Reddit JSON API"""
         try:
-            headers = {'User-Agent': 'LiveNews-AI-Bot/1.0'}
+            headers = {'User-Agent': 'வெளிச்சம்-AI-Bot/1.0'}
             response = requests.get(json_url, headers=headers, timeout=10)
             response.raise_for_status()
             
@@ -629,9 +610,17 @@ class LiveNewsAI:
             all_news.sort(key=lambda x: x['date'], reverse=True)
         self.logger.info(f"Total articles collected: {len(all_news)}")
         
-        # Apply freshness filtering when available to avoid outdated news
-        if self.freshness_validator:
-            all_news = self.freshness_validator.filter_fresh_articles(all_news)
+        # Simple freshness filtering without external APIs
+        # Remove articles older than 3 days
+        fresh_news = []
+        for article in all_news:
+            try:
+                article_date = datetime.strptime(article['date'], '%Y-%m-%d %H:%M')
+                if (datetime.now() - article_date).days <= 3:
+                    fresh_news.append(article)
+            except:
+                fresh_news.append(article)  # Keep if date parsing fails
+        all_news = fresh_news
             
         return all_news[:15]
         
@@ -647,255 +636,96 @@ class LiveNewsAI:
         return any(keyword in user_lower for keyword in news_keywords)
         
     def chat_with_news(self, user_input: str) -> str:
-        """Main chat function with Pathway RAG and news integration"""
+        """Simple chat function without external APIs"""
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        model_available = self.model_available
-        topic = self._extract_topic(user_input)
-        wants_summary = self._wants_summary(user_input)
-        wants_full_text = self._wants_full_text(user_input)
         
-        # Check if user wants news
-        if self.is_news_query(user_input):
-            # Try Pathway RAG first for better results
-            if self.rag_available:
+        # Simple keyword-based responses without external AI
+        user_lower = user_input.lower()
+        
+        if any(word in user_lower for word in ['hello', 'hi', 'hey']):
+            return f"Hello! I'm your வெளிச்சம் assistant. Ask me about recent news or type 'latest news' to see current headlines."
+            
+        if any(word in user_lower for word in ['news', 'latest', 'headlines', 'today']):
+            # Return latest cached articles as simple text
+            if self.cached_articles:
+                response = f"📰 Latest News ({current_time}):\n\n"
+                for i, article in enumerate(self.cached_articles[:5], 1):
+                    response += f"{i}. {article['title']}\n   Source: {article['source']} | {article.get('date_with_age', article['date'])}\n\n"
+                return response
+            else:
+                return "I'm currently collecting the latest news. Please try again in a moment."
+                
+        return "I can help you with the latest news headlines. Try asking 'What's the latest news?' or 'Show me today's headlines'."
+    
+    def get_articles_for_display(self) -> List[Dict[str, Any]]:
+        """Get articles formatted for web display"""
+        if not self.cached_articles:
+            # Try to fetch fresh articles if cache is empty
+            articles = self.fetch_and_store_news()
+            self.cached_articles = articles[:30]
+        
+        # Format articles for display
+        display_articles = []
+        for article in self.cached_articles:
+            display_article = {
+                'title': article.get('title', 'No Title'),
+                'content': article.get('content', '')[:500] + '...',
+                'summary': article.get('content', '')[:200] + '...',
+                'source': article.get('source', 'Unknown'),
+                'category': article.get('category', 'General'),
+                'date': article.get('date', ''),
+                'url': article.get('url', '#'),
+                'reading_time': len(article.get('content', '').split()) // 200 + 1  # Rough estimate
+            }
+            display_articles.append(display_article)
+        
+        return display_articles
+
+    def chat_with_news(self, user_input: str) -> str:
+        """Enhanced chat with news context using Gemini"""
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Check if it's a news-related query
+        if self._is_news_query(user_input):
+            # Try RAG first
+            if hasattr(self, 'rag_system') and self.rag_system:
                 try:
-                    # Fast existence check using private Pathway RAG method
-                    if topic:
-                        try:
-                            has_any = self.pathway_rag.has_recent_news(topic, hours=24, min_similarity=0.5)
-                        except Exception:
-                            has_any = True  # fail open to avoid blocking
-                        # For existence-style questions, reply immediately with yes/no using Pathway-only check
-                        if self._is_existence_query(user_input):
-                            return (
-                                f"Yes, there are recent updates on {topic}."
-                                if has_any else
-                                f"No hot news recently on {topic}."
-                            )
-                        if not has_any and topic:  # Only return "no news" if specific topic was requested
-                            return f"I don't have recent news about {topic} at the moment, but I'll keep looking for updates and provide them later when available."
-
-                    rag_result = self.pathway_rag.query(user_input)
-                    
-                    if rag_result['sources']:
-                        # Use RAG results
-                        news_context = f"Current Date & Time: {current_time}\n\n"
-                        news_context += "Relevant News (via Pathway RAG):\n"
-                        
-                        # Sort sources by recency when possible
-                        def _parse_dt(d):
-                            try:
-                                return datetime.strptime(d, '%Y-%m-%d %H:%M')
-                            except Exception:
-                                try:
-                                    return datetime.strptime(d, '%Y-%m-%d %H:%M:%S')
-                                except Exception:
-                                    return datetime.min
-                        sorted_sources = sorted(rag_result['sources'], key=lambda s: _parse_dt(str(s.get('date',''))), reverse=True)
-                        for i, source in enumerate(sorted_sources[:5], 1):
-                            title = source.get('title', 'No title')
-                            content = source.get('content', '')
-                            
-                            # Check for missing content
-                            if not content or len(content.strip()) < 20:
-                                content = "[Content not available or too brief]"
-                            
-                            # Enhanced date display with age
-                            date_info = source.get('date', 'Unknown date')
-                            try:
-                                source_date = datetime.strptime(date_info, '%Y-%m-%d %H:%M')
-                                age = datetime.now() - source_date
-                                if age.days > 7:
-                                    age_str = f" ({age.days} days old - may be outdated)"
-                                elif age.days > 3:
-                                    age_str = f" ({age.days} days ago)"
-                                elif age.days > 0:
-                                    age_str = f" ({age.days}d ago)"
-                                else:
-                                    age_str = " (recent)"
-                                date_display = date_info + age_str
-                            except:
-                                date_display = date_info
-                                
-                            news_context += f"{i}. {title}\n"
-                            news_context += f"   Published: {date_display}\n"
-                            news_context += f"   Content: {content}\n\n"  # Full content, no truncation
-                        
-                        # Add freshness info if available
-                        if rag_result.get('freshness_report'):
-                            freshness = rag_result['freshness_report']
-                            fresh_percent = freshness.get('freshness_percentage', {}).get('fresh', 0)
-                            news_context += f"News Freshness: {fresh_percent}% recent content\n\n"
-                        
-                        # If Gemini isn't available, return concise bullet points immediately
-                        if wants_summary or not self.model_available:
-                            bullets = []
-                            for src in sorted_sources[:3]:
-                                title = src.get('title', 'No title')
-                                date = src.get('date', '?')
-                                bullet = f"- {title} ({date})"
-                                bullets.append(bullet)
-                            return "Here are the latest updates:\n" + "\n".join(bullets)
-                        
-                        # Enhanced prompt for news responses
-                        if wants_full_text:
-                            prompt = f"""You are a news AI assistant. Provide detailed information using the news below. Focus on the key facts and context from the articles. DO NOT mention specific news sources or where the information came from.
-
-{news_context}
-
-User: {user_input}
-
-Provide a comprehensive response with details from the available news information without revealing sources."""
-                        else:
-                            prompt = f"""You are a news AI assistant. Answer concisely using the news below. Focus on the most important facts. DO NOT mention specific news sources or where the information came from.
-
-{news_context}
-
-User: {user_input}
-
-Give a brief, direct response (2-3 sentences max) based on the available news information without revealing sources."""
-
-                    else:
-                        # RAG found no results, fallback to direct news fetch
-                        latest_news = self.fetch_latest_news(24, user_input)
-                        
-                        if latest_news:
-                            news_context = f"Current Date & Time: {current_time}\n\n"
-                            news_context += "Latest News Headlines:\n"
-                            
-                            for i, news in enumerate(latest_news[:5], 1):
-                                # Check for missing content
-                                summary = news.get('summary', '')
-                                if not summary or len(summary.strip()) < 20:
-                                    summary = "[No content available for this article]"
-                                
-                                # Use enhanced date display if available
-                                date_display = news.get('date_with_age', news.get('date', 'Unknown date'))
-                                
-                                # Add warning for old content
-                                warning = ""
-                                if news.get('is_old', False):
-                                    warning = " ⚠️ OLD NEWS"
-                                    
-                                news_context += f"{i}. {news['title']}{warning}\n"
-                                news_context += f"   Published: {date_display}\n"
-                                news_context += f"   Content: {summary}\n\n"
-                            if wants_summary or not self.model_available:
-                                bullets = [
-                                    f"- {n['title']} ({n['date']})" for n in latest_news[:3]
-                                ]
-                                return "Here are the latest updates:\n" + "\n".join(bullets)
-                            
-                            if wants_full_text:
-                                prompt = f"""Provide detailed analysis using the news below. Focus on comprehensive coverage of the news content. DO NOT mention specific news sources or where the information came from.
-
-{news_context}
-
-User: {user_input}
-
-Provide comprehensive coverage based on the available news information without revealing sources."""
-                            else:
-                                prompt = f"""Answer briefly using news below. Focus on the key facts from the available news sources. DO NOT mention specific news sources or where the information came from.
-
-{news_context}
-
-User: {user_input}
-
-Keep response short (2-3 sentences) based on the news information without revealing sources."""
-                        else:
-                            # If user asked about a specific topic/location and nothing found, respond clearly
-                            if topic:
-                                return f"I don't have recent news about {topic} at the moment, but I'll keep looking for updates and provide them later when available."
-                            
-                            # Try to get any recent news to show instead of generic response
-                            fallback_news = self.fetch_latest_news(24, user_input)
-                            if fallback_news:
-                                news_context = f"Current Date & Time: {current_time}\n\n"
-                                news_context += "Latest Available News:\n"
-                                for i, news in enumerate(fallback_news[:3], 1):
-                                    summary = news.get('summary', news.get('content', ''))[:200] + "..."
-                                    date_display = news.get('date', 'Unknown date')
-                                    news_context += f"{i}. {news['title']}\n"
-                                    news_context += f"   Published: {date_display}\n"
-                                    news_context += f"   Summary: {summary}\n\n"
-                                
-                                prompt = f"""Based on the latest news available, provide a helpful response. DO NOT mention specific news sources.
-
-{news_context}
-
-User: {user_input}
-
-Provide a brief, helpful response based on the available news information without revealing sources."""
-                            else:
-                                prompt = f"""No recent news found. Current time: {current_time}
-
-User: {user_input}
-
-Brief response: I don't have current news updates available at the moment. Please try again in a few minutes as I'm continuously updating my news database."""
-                            
+                    rag_response = self.rag_system.query(user_input)
+                    if rag_response and rag_response.strip():
+                        return rag_response
                 except Exception as e:
                     self.logger.error(f"RAG query failed: {e}")
-                    # Fallback to simple news fetch
-                    latest_news = self.fetch_latest_news(24, user_input)
-                    
-                    if latest_news:
-                        news_context = f"Current Date & Time: {current_time}\n\n"
-                        news_context += "Latest News Headlines:\n"
-                        
-                        for i, news in enumerate(latest_news[:5], 1):
-                            news_context += f"{i}. {news['title']}\n"
-                            news_context += f"   Source: {news['source']} | {news['date']}\n"
-                            news_context += f"   Summary: {news['summary']}\n\n"
-                        if wants_summary or not self.model_available:
-                            bullets = [
-                                f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
-                            ]
-                            return "Here are the latest updates:\n" + "\n".join(bullets)
-                        
-                        prompt = f"""You are a helpful AI assistant with access to real-time news. Based on the current news below, answer the user's question naturally and conversationally.
-
-{news_context}
-
-User: {user_input}
-
-Provide a natural, informative response using the news information above. Be conversational and helpful."""
-                    else:
-                        if topic:
-                            return f"No hot news recently on {topic}."
-                        prompt = f"""You are a helpful AI assistant. The user asked about news but no recent articles were found. Current time: {current_time}
-
-User: {user_input}
-
-Explain that you don't have access to the very latest news and suggest they check news websites directly."""
-            else:
-                # No RAG available, use simple news fetch
-                latest_news = self.fetch_latest_news(24, user_input)
+            
+            # Fallback to simple news fetch
+            topic = self._extract_topic(user_input)
+            latest_news = self.fetch_latest_news(24, user_input)
+            
+            if latest_news:
+                news_context = f"Current Date & Time: {current_time}\n\n"
+                news_context += "Latest News Headlines:\n"
                 
-                if latest_news:
-                    news_context = f"Current Date & Time: {current_time}\n\n"
-                    news_context += "Latest News Headlines:\n"
-                    
-                    for i, news in enumerate(latest_news[:5], 1):
-                        news_context += f"{i}. {news['title']}\n"
-                        news_context += f"   Source: {news['source']} | {news['date']}\n"
-                        news_context += f"   Summary: {news['summary']}\n\n"
-                    if not self.model_available:
-                        bullets = [
-                            f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
-                        ]
-                        return "Here are the latest updates:\n" + "\n".join(bullets)
-                    
-                    prompt = f"""You are a helpful AI assistant with access to real-time news. Based on the current news below, answer the user's question naturally and conversationally.
+                for i, news in enumerate(latest_news[:5], 1):
+                    news_context += f"{i}. {news['title']}\n"
+                    news_context += f"   Source: {news['source']} | {news['date']}\n"
+                    news_context += f"   Summary: {news['summary']}\n\n"
+                
+                if not self.model_available:
+                    bullets = [
+                        f"- {n['title']} — {n['source']} ({n['date']})" for n in latest_news[:3]
+                    ]
+                    return "Here are the latest updates:\n" + "\n".join(bullets)
+                
+                prompt = f"""You are a helpful AI assistant with access to real-time news. Based on the current news below, answer the user's question naturally and conversationally.
 
 {news_context}
 
 User: {user_input}
 
 Provide a natural, informative response using the news information above. Be conversational and helpful."""
-                else:
-                    if topic:
-                        return f"No hot news recently on {topic}."
-                    prompt = f"""You are a helpful AI assistant. The user asked about news but no recent articles were found. Current time: {current_time}
+            else:
+                if topic:
+                    return f"No recent news found on {topic}."
+                prompt = f"""You are a helpful AI assistant. The user asked about news but no recent articles were found. Current time: {current_time}
 
 User: {user_input}
 
@@ -989,7 +819,7 @@ Give a brief, direct response (1-2 sentences)."""
         return any(k in tl for k in ['full text', 'full article', 'complete article', 'entire article', 'full content', 'whole article'])
 
 # Initialize the AI
-news_ai = LiveNewsAI()
+news_ai = வெளிச்சம்AI()
 
 @app.route('/')
 def home():

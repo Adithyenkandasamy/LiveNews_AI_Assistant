@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🏆 Enhanced வெளிச்சம் Intelligence Platform</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+        
+        .header {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            padding: 1rem 2rem;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        
+        .header h1 {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            text-align: center;
+        }
+        
+        .stats-bar {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin-top: 1rem;
+        }
+        
+        .stat-item {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: bold;
+        }
+        
+        .main-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        
+        .controls {
+            background: rgba(255, 255, 255, 0.9);
+            padding: 1.5rem;
+            border-radius: 15px;
+            margin-bottom: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        
+        .refresh-btn {
+            background: linear-gradient(135deg, #00b894, #00cec9);
+            color: white;
+            border: none;
+            padding: 0.8rem 1.5rem;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        
+        .refresh-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,184,148,0.3);
+        }
+        
+        .chat-toggle {
+            background: linear-gradient(135deg, #ff7675, #fd79a8);
+            color: white;
+            border: none;
+            padding: 0.8rem 1.5rem;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        
+        .chat-toggle:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(255,118,117,0.3);
+        }
+        
+        .articles-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+            gap: 2rem;
+            margin-bottom: 3rem;
+        }
+        
+        .article-card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .article-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.15);
+        }
+        
+        .article-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+        }
+        
+        .article-title {
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 1rem;
+            line-height: 1.4;
+        }
+        
+        .article-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            color: #666;
+        }
+        
+        .source-badge {
+            background: linear-gradient(135deg, #74b9ff, #0984e3);
+            color: white;
+            padding: 0.3rem 0.8rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .category-badge {
+            background: rgba(102, 126, 234, 0.1);
+            color: #667eea;
+            padding: 0.3rem 0.8rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .article-summary {
+            color: #666;
+            line-height: 1.6;
+            margin-bottom: 1rem;
+        }
+        
+        .article-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 1rem;
+        }
+        
+        .sentiment-indicator {
+            padding: 0.3rem 0.8rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .sentiment-positive {
+            background: rgba(0, 184, 148, 0.1);
+            color: #00b894;
+        }
+        
+        .sentiment-negative {
+            background: rgba(231, 76, 60, 0.1);
+            color: #e74c3c;
+        }
+        
+        .sentiment-neutral {
+            background: rgba(116, 185, 255, 0.1);
+            color: #74b9ff;
+        }
+        
+        .reading-time {
+            color: #666;
+            font-size: 0.9rem;
+        }
+        
+        .chat-container {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            width: 400px;
+            height: 500px;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+            display: none;
+            flex-direction: column;
+            z-index: 1000;
+        }
+        
+        .chat-header {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 1rem;
+            border-radius: 20px 20px 0 0;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chat-close {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 1.2rem;
+            cursor: pointer;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            padding: 1rem;
+            overflow-y: auto;
+            max-height: 350px;
+        }
+        
+        .chat-input-container {
+            padding: 1rem;
+            border-top: 1px solid #eee;
+        }
+        
+        .chat-input {
+            width: 100%;
+            padding: 0.8rem;
+            border: 2px solid #eee;
+            border-radius: 15px;
+            outline: none;
+            transition: border-color 0.3s ease;
+        }
+        
+        .chat-input:focus {
+            border-color: #667eea;
+        }
+        
+        .message {
+            margin-bottom: 1rem;
+            padding: 0.8rem;
+            border-radius: 15px;
+            max-width: 80%;
+        }
+        
+        .message.user {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            margin-left: auto;
+            text-align: right;
+        }
+        
+        .message.bot {
+            background: rgba(116, 185, 255, 0.1);
+            color: #333;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: #666;
+        }
+        
+        .no-articles {
+            text-align: center;
+            padding: 3rem;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 20px;
+            color: #666;
+        }
+        
+        @media (max-width: 768px) {
+            .articles-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .chat-container {
+                width: 90%;
+                right: 5%;
+                bottom: 20px;
+            }
+            
+            .controls {
+                flex-direction: column;
+                gap: 1rem;
+            }
+            
+            .stats-bar {
+                flex-wrap: wrap;
+                gap: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🏆 Enhanced வெளிச்சம் Intelligence</h1>
+        <div class="stats-bar">
+            <div class="stat-item">📰 {{ stats.total_articles }} Articles</div>
+            <div class="stat-item">📡 {{ stats.sources_count }} Sources</div>
+            <div class="stat-item">🏷️ {{ stats.categories_count }} Categories</div>
+            <div class="stat-item">🤖 {{ stats.ai_enhanced }} AI Enhanced</div>
+            <div class="stat-item">⏰ Updated {{ stats.last_updated }}</div>
+            {% if stats.quota_status == 'Limited' %}
+            <div class="stat-item" style="background: linear-gradient(135deg, #ff7675, #fd79a8);">⚠️ API Limited</div>
+            {% else %}
+            <div class="stat-item" style="background: linear-gradient(135deg, #00b894, #00cec9);">✅ API Active</div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="main-container">
+        <div class="controls">
+            <h2 style="color: #667eea;">🌟 Live Intelligence Feed</h2>
+            <div>
+                <button class="refresh-btn" onclick="refreshNews()">🔄 Refresh News</button>
+                <button class="chat-toggle" onclick="toggleChat()">💬 AI Assistant</button>
+            </div>
+        </div>
+
+        {% if articles %}
+        <div class="articles-grid">
+            {% for article in articles %}
+            <div class="article-card" onclick="openArticle('{{ article.id }}')">
+                <h3 class="article-title">{{ article.title }}</h3>
+                
+                <div class="article-meta">
+                    <span class="source-badge">{{ article.source }}</span>
+                    <span class="category-badge">{{ article.category }}</span>
+                    <span>{{ article.published_at }}</span>
+                </div>
+                
+                <div class="article-summary">{{ article.summary }}</div>
+                
+                <div class="article-footer">
+                    {% if article.sentiment > 0.2 %}
+                    <span class="sentiment-indicator sentiment-positive">😊 Positive</span>
+                    {% elif article.sentiment < -0.2 %}
+                    <span class="sentiment-indicator sentiment-negative">😔 Negative</span>
+                    {% else %}
+                    <span class="sentiment-indicator sentiment-neutral">😐 Neutral</span>
+                    {% endif %}
+                    
+                    <span class="reading-time">⏱️ {{ article.reading_time }} min read</span>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="no-articles">
+            <h3>🔄 Loading Latest News...</h3>
+            <p>Fetching articles from multiple sources with AI enhancements</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Chat Interface -->
+    <div class="chat-container" id="chatContainer">
+        <div class="chat-header">
+            <span>🤖 AI News Assistant</span>
+            <button class="chat-close" onclick="toggleChat()">×</button>
+        </div>
+        <div class="chat-messages" id="chatMessages">
+            <div class="message bot">
+                Hello! I'm your AI news assistant. Ask me about any recent news or topics you're interested in. I can help you understand current events with insights from multiple sources.
+            </div>
+        </div>
+        <div class="chat-input-container">
+            <input type="text" class="chat-input" id="chatInput" placeholder="Ask about recent news...">
+            <button class="chat-send-btn" onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+flask==3.0.0
+requests==2.31.0
+feedparser==6.0.10
+beautifulsoup4==4.12.2
+numpy==1.24.3
+pandas==2.0.3
+sentence-transformers==2.2.2
+python-dotenv==1.0.0
+psycopg2-binary==2.9.7
+google-generativeai==0.3.2
+gnewsclient==1.21
+newsapi-python==0.2.7
